@@ -7,4 +7,4 @@ if [ ! -f "$BLENDER_PATH" ]; then
     exit 1
 fi
 
-$BLENDER_PATH --background main.blend --python main.py
+$BLENDER_PATH --background --factory-startup --python main.py

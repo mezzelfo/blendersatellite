@@ -1,5 +1,6 @@
 from datetime import datetime
 import bpy
+from mathutils import Vector
 import os
 import json
 import numpy as np
@@ -45,6 +46,78 @@ shader affine_camera_simple(
 }
 """
 
+def start_from_scratch():
+    """
+    Start from a truly empty Blender scene, independent of any .blend file.
+    """
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+
+
+def import_tsdf_mesh_from_ply(ply_path):
+    """
+    Import the .ply mesh and force the object/data names expected by the script.
+    """
+    assert os.path.exists(ply_path), ply_path
+
+    # Blender 4.x
+    if hasattr(bpy.ops.wm, "ply_import"):
+        bpy.ops.wm.ply_import(filepath=ply_path)
+    # Older Blender versions
+    else:
+        bpy.ops.import_mesh.ply(filepath=ply_path)
+
+    mesh_obj = bpy.context.object
+    mesh_obj.name = "tsdf_mesh_B"
+    mesh_obj.data.name = "tsdf_mesh_B"
+
+    return mesh_obj
+
+
+def create_camera():
+    cam_data = bpy.data.cameras.new("Camera")
+    cam_obj = bpy.data.objects.new("Camera", cam_data)
+    bpy.context.collection.objects.link(cam_obj)
+
+    cam_obj.location = (0, 0, 0)
+    cam_obj.rotation_euler = (0, 0, 0)
+
+    bpy.context.scene.camera = cam_obj
+
+    return cam_obj
+
+
+def create_sun():
+    light_data = bpy.data.lights.new("Light", type="SUN")
+    light_obj = bpy.data.objects.new("Light", light_data)
+    bpy.context.collection.objects.link(light_obj)
+
+    light_obj.location = (2, 2, 2)
+
+    return light_obj
+
+
+def setup_scene_from_scratch(root_path):
+    start_from_scratch()
+
+    ply_path = os.path.join(root_path, "tsdf_mesh_B.ply")
+
+    mesh_obj = import_tsdf_mesh_from_ply(ply_path)
+    camera_obj = create_camera()
+    light_obj = create_sun()
+
+    bpy.context.scene.render.engine = "CYCLES"
+
+    # Required for the OSL custom camera shader.
+    bpy.context.scene.cycles.shading_system = True
+
+    # Reduce the number of samples for faster rendering during testing.
+    bpy.context.scene.cycles.samples = 4
+
+    # Disable denoising for faster rendering during testing.
+    bpy.context.scene.cycles.use_denoising = False
+
+    return mesh_obj, camera_obj, light_obj
+
 def null_space(A, rcond=None):
     u, s, vh = np.linalg.svd(A, full_matrices=True)
     M, N = u.shape[0], vh.shape[1]
@@ -56,6 +129,17 @@ def null_space(A, rcond=None):
     return Q
 
 def EOGS_to_blender(A,b,z0=-5.0):
+    # Convert coordinates used by the Blender mesh/shader into the coordinates
+    # expected by the EOGS affine model.
+    #
+    # This says:
+    #   x_EOGS =  x_Blender
+    #   y_EOGS =  y_Blender
+    #   z_EOGS = -z_Blender
+    EOGS_FROM_BLENDER = np.diag([1.0, 1.0, -1.0])
+    A = A @ EOGS_FROM_BLENDER
+
+
     if A.shape == (3,3) and b.shape == (3,):
         A = A[:2,:]
         b = b[:2]
@@ -72,7 +156,12 @@ def EOGS_to_blender(A,b,z0=-5.0):
     Atilde[:2,3] = b
     Atilde[2,-1] = -z0
 
-    Atilde[0,:] *= -1  # flip x axis
+    # Convert between image/raster vertical-axis conventions.
+    # This flips the second image coordinate, not the world X axis.
+    # Many image/camera models use image coordinates where the vertical
+    # coordinate increases downward, as in standard pixel row coordinates.
+    # Blender-style camera/raster coordinates are treated as increasing upward.
+    Atilde[1, :] *= -1
 
     # Create the template values
     templated_direction = f"{N[0]}, {N[1]}, {N[2]}"
@@ -90,6 +179,9 @@ def EOGS_to_blender(A,b,z0=-5.0):
 scene = 'JAX_068'
 root_path = os.path.dirname(os.path.abspath(__file__))
 print(f"Root path: {root_path}")
+
+mesh_obj, camera_obj, light_obj = setup_scene_from_scratch(root_path)
+
 affine_model_path = os.path.join(root_path, 'EOGS_affine_models', scene, 'affine_models.json')
 assert os.path.exists(affine_model_path), affine_model_path
 
@@ -99,6 +191,12 @@ os.makedirs(output_path, exist_ok=True)
 
 with open(affine_model_path, "r") as f:
     affine_models = json.load(f)
+
+    # Extract the scale factor from the first camera model
+    scale_factor = affine_models[0]['model']['scale']
+    # Apply the scale factor to the mesh
+    mesh_obj.scale = (1.0/scale_factor, 1.0/scale_factor, 1.0/scale_factor)
+
     for camera in affine_models:
         camera_name = camera['img']
 
@@ -127,25 +225,10 @@ with open(affine_model_path, "r") as f:
         ################
         Sdir = np.array(camera['sun_model']['sun_dir_ecef']).flatten()
         Sdir = Sdir / np.linalg.norm(Sdir)
-        # Sdir[0] *= -1
-        # Sdir[1] *= -1
-        # bpy.data.lights["Light"].type = 'POINT'
-        # bpy.data.objects["Light"].location = (Sdir*2).tolist()
-
-        Sdir[-1] *= -1
         bpy.data.lights["Light"].type = 'SUN'
-        bpy.data.objects["Light"].location = (2,2,2)
-        bpy.data.objects["Light"].rotation_mode = 'QUATERNION' #wxyz
-        localforward = np.array([0,0,-1])
-        theta = np.dot(Sdir, localforward)
-        axis = np.cross(localforward, Sdir)
-        axis = axis / np.linalg.norm(axis)
-        w = np.sqrt((1.0+theta)*0.5)
-        x = axis[0]*np.sqrt((1.0-theta)*0.5)
-        y = axis[1]*np.sqrt((1.0-theta)*0.5)
-        z = axis[2]*np.sqrt((1.0-theta)*0.5)
-        bpy.data.objects["Light"].rotation_quaternion = (w,x,y,z)
-
+        bpy.data.objects["Light"].location = (2, 2, 2)
+        bpy.data.objects["Light"].rotation_mode = 'QUATERNION'
+        bpy.data.objects["Light"].rotation_quaternion = Vector(Sdir).to_track_quat('Z', 'X')
 
         ################
         # Set the image resolution
