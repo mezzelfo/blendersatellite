@@ -12,4 +12,5 @@ wheels/
 blender_affine_models/
 # EOGS_affine_models/
 output/
+data/
 # Track3-RGB-crops/
