@@ -13,4 +13,8 @@ blender_affine_models/
 # EOGS_affine_models/
 output/
 data/
+OBJ/
+*.zip
+*.blend
+*.blend1
 # Track3-RGB-crops/
