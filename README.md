@@ -81,11 +81,45 @@ these small previews so it does not introduce an unsupported CPU denoising pass.
 
 This runs `orbits/scripts/melbourne_overpass.py`, prepares the selected
 downloaded ZIP tiles, then starts headless Blender with `render_swarm.py`.
-Outputs are `output/orbits_melbourne/satellite_00.png` through
-`satellite_04.png`, plus `render_report.json`. Satellite 0 is the chief. The
-five poses at a common epoch, footprint corners, physical optics, and sensor
-crop calibration are in `orbits/outputs/melbourne-overpass/cameras.json`;
-the actual 61-step propagated trajectories are saved alongside it.
+The default formation is a five-satellite train with the chief in the middle:
+`deputy 1 → deputy 2 → chief → deputy 3 → deputy 4`. Every adjacent pair is
+1 km apart in 3D at the capture epoch. Positions and velocities are rotated
+about the orbital normal using equal phase increments; the phase step is
+`2*asin(1000/(2*orbit_radius))`, giving exactly 1 km chord separation.
+The whole formation is propagated backward 30 seconds and forward 60 seconds
+with the J2 dynamics, so the saved capture state is from the propagated
+trajectory. Separation is not constrained by stationkeeping. Measured pair
+distances and adjacent extrema over the sampled minute are saved in each run's
+`simulation/formation_distances.json`.
+
+Use `TRAIN_SPACING_M=100000 bash run_orbits_melbourne.sh` for a 100 km train, or
+`FORMATION=random bash run_orbits_melbourne.sh` for the former compact random
+swarm. The standalone exporter accepts `--formation` and `--train-spacing-m`.
+Every invocation creates a fresh directory such as
+`output/orbits_melbourne/20261028T171037Z_run_8bJvD7/`; the UTC timestamp plus
+unique suffix prevents collisions even for simultaneous runs. `RUNS_ROOT`
+changes the root directory; passing `--output` to the wrapper is disallowed.
+Existing runs are never overwritten. Each directory contains:
+
+- `simulation/`: trajectories, configuration, initial camera poses, tile grid,
+  and formation distances.
+- `renders/`: `satellite_00.png` through `satellite_04.png`, final camera poses,
+  and the render report.
+- `pipeline.log`: run settings, selected GPU devices, validation and render log.
+
+Terrain caches and the downloaded tile grid under `data/` remain shared across
+runs. The older flat output directory and simulation outputs are preserved.
+Standalone exporter runs without `--output` also create unique timestamped
+folders. Explicit exporter/renderer paths refuse to overwrite prior artifacts.
+Satellite 0 is the chief. The
+initial poses at a common epoch, footprint corners, physical optics, and sensor
+crop calibration are in the run's `simulation/cameras.json`;
+the actual 61-step propagated trajectories are saved alongside it. The WGS84
+target is computed analytically in ECEF at zero ellipsoidal height (semi-major
+axis 6378137 m, inverse flattening 298.257223563), using the nearest forward ray
+intersection. Rendering does not use a mesh or terrain hit to choose the target.
+The renderer independently recomputes this target, and final poses are saved in
+the run's `renders/camera_poses.json` and referenced by the render report.
 
 The cameras are ordinary perspective cameras with a 580 mm lens and 95 mm
 aperture (f/6.1), using a roughly 2.97 mm central sensor crop to obtain 512×512
@@ -94,8 +128,23 @@ This is an RGB instantaneous-frame approximation of the HyperScape100
 pushbroom instrument, not a hyperspectral or detector-noise simulation.
 Specifications: <https://simera-sense.com/products/hyperscape100/>.
 
-Nadir is geocentric (camera -Z points at Earth's center); image +Y follows
-projected ground-track velocity. The fixed-pole orbit model uses GMST with
+The chief remains geocentric nadir (camera -Z points at Earth's center), with
+image +Y following projected ground-track velocity. By default each deputy
+targets the chief's ray intersection with the WGS84 ellipsoid. Deputy roll
+is chosen so the ground-projected image +X (across-track) direction matches the
+chief's direction and sign. Projection here means the derivative of neighboring
+camera rays intersecting the ground plane, including oblique perspective shear.
+For forward direction `f` and image-right axis `r`, this derivative is proportional
+to `r - f*r.z/f.z`. If `d` is the chief's unit ground across-track direction,
+the deputy's right axis is `normalize(d - f*dot(d,f))`. This makes the projected
+across-track direction a positive multiple of `d` and fixes the remaining roll.
+The chief's attitude is never modified. Set `POINTING_MODE=nadir` to restore
+independent nadir pointing for comparison.
+
+The image center GSD remains 5 m/pixel in the across-track ground direction;
+along-track GSD can differ slightly under oblique viewing and is recorded in
+each pose. Every render validates the common target's image-center projection
+and the across-track alignment. The fixed-pole orbit model uses GMST with
 UTC approximating UT1 for its Earth-fixed rotation. Melbourne coordinates
 are converted from EPSG:7855 into a shared local ENU frame in double precision.
 For this preview, AHD heights approximate ellipsoidal heights; precision Earth

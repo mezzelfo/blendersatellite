@@ -6,11 +6,19 @@ from pathlib import Path
 import sys
 import time
 import subprocess
+import importlib.util
 
 import bpy
 from bpy_extras.object_utils import world_to_camera_view
 from mathutils import Matrix, Vector
 import numpy as np
+
+# Load the pinned, NumPy-only helper directly: importing orbits.__init__ inside
+# Blender would also import PyTorch, which belongs in the conda environment.
+_geometry_path=Path(__file__).resolve().parent/'orbits/src/orbits/camera_geometry.py'
+_spec=importlib.util.spec_from_file_location('orbits_camera_geometry',_geometry_path)
+camera_geometry=importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(camera_geometry)
 
 
 def configure_gpu(scene,backend,indices):
@@ -58,6 +66,9 @@ def main():
     parser.add_argument('--gpu-devices',default='all',help='all, or comma-separated indices within the chosen backend')
     args=parser.parse_args(sys.argv[sys.argv.index('--')+1:])
     manifest=json.loads(args.cameras.read_text())
+    if not args.check_only and (any(args.output.glob('satellite_*.png')) or
+                               (args.output/'render_report.json').exists()):
+        parser.error('--output already contains render artifacts; select a new run directory')
     args.output.mkdir(parents=True,exist_ok=True)
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene=bpy.context.scene
@@ -103,6 +114,20 @@ def main():
         obj=bpy.data.objects.new(tile,mesh);scene.collection.objects.link(obj)
         obj.data.materials.append(material);triangles+=len(faces)
     if missing: raise RuntimeError(f'Missing {len(missing)} selected terrain caches: {missing}')
+    if manifest.get('pointing_mode')=='chief-target':
+        chief=next(c for c in manifest['cameras'] if c['role']=='chief')
+        target_local,target_ecef=camera_geometry.chief_wgs84_target(chief,
+            manifest['origin_ecef_m'],manifest['local_from_ecef'])
+        records,target,across=camera_geometry.retarget_cameras(manifest['cameras'],'chief-target',target_local)
+        manifest.update(cameras=records,common_target_local_m=target,chief_ground_across_local=across,
+            common_target_ecef_m=target_ecef.tolist(),
+            target_source='chief boresight intersection with WGS84 ellipsoid at zero ellipsoidal height',
+            target_ellipsoid=dict(name='WGS84',semi_major_axis_m=camera_geometry.WGS84_A,
+                                  semi_minor_axis_m=camera_geometry.WGS84_B))
+        print(f'Common WGS84 target: {target}; chief attitude preserved',flush=True)
+    resolved_path=args.output/'camera_poses.json'
+    if not args.check_only:
+        resolved_path.write_text(json.dumps(manifest,indent=2)+'\n')
     camera_data=bpy.data.cameras.new('HyperScape100 cropped RGB approximation')
     camera=bpy.data.objects.new('SatelliteCamera',camera_data)
     scene.collection.objects.link(camera);scene.camera=camera
@@ -130,12 +155,22 @@ def main():
         if error>2e-4:raise RuntimeError(f'Camera {index} footprint reprojection failed: {error}')
         center=Vector(record['ground_center_local_m'])
         # One pixel on the reference plane in image-horizontal direction.
-        direction=Vector([record['camera_to_local'][k][0] for k in range(3)])
-        direction.z=0;direction.normalize()
+        forward=-np.asarray(record['camera_to_local'])[:,2]
+        right=np.asarray(record['camera_to_local'])[:,0]
+        projected_across=camera_geometry.unit(camera_geometry.ground_direction(forward,right))
+        direction=Vector(projected_across)
         p0=world_to_camera_view(scene,camera,center)
         p1=world_to_camera_view(scene,camera,center+direction*5)
         pixel_step=512*float(np.hypot(p1.x-p0.x,p1.y-p0.y))
         if abs(pixel_step-1)>.002:raise RuntimeError(f'Camera {index} 5 m projection={pixel_step} pixels')
+        target_error=None;alignment=None
+        if manifest.get('pointing_mode')=='chief-target':
+            target_pixel=world_to_camera_view(scene,camera,Vector(manifest['common_target_local_m']))
+            target_error=512*float(np.hypot(target_pixel.x-.5,target_pixel.y-.5))
+            alignment=float(np.dot(projected_across,manifest['chief_ground_across_local']))
+            if target_error>.01 or alignment<1-1e-10:
+                raise RuntimeError(f'Camera {index}: target error {target_error}px, across-track alignment {alignment}')
+            print(f'Camera {index}: common target error={target_error:.6f}px, ground-across dot={alignment:.12f}',flush=True)
         if args.check_only:
             print(f'Camera {index}: corner error {error:.3g}; 5m={pixel_step:.6f}px',flush=True)
             continue
@@ -151,12 +186,15 @@ def main():
         print(f'Satellite {index}: geometry coverage {coverage:.2%}',flush=True)
         results.append(dict(satellite_id=index,image=str(path.resolve()),render_seconds=time.monotonic()-start,
                             corner_reprojection_error=error,pixels_per_5m=pixel_step,
+                            common_target_error_pixels=target_error,ground_across_alignment_with_chief=alignment,
                             gpu_process_snapshot=gpu_process_snapshot(),
                             geometry_coverage_fraction=coverage))
     if args.check_only:
         print('All Blender camera projection checks passed',flush=True)
         sys.stdout.flush();os._exit(0)
     (args.output/'render_report.json').write_text(json.dumps(dict(cameras=str(args.cameras.resolve()),
+        resolved_cameras=str(resolved_path.resolve()),pointing_mode=manifest.get('pointing_mode','nadir'),
+        common_target_local_m=manifest.get('common_target_local_m'),target_source=manifest.get('target_source'),
         terrain_tiles=len(manifest['selected_tiles']),triangles=triangles,samples=args.samples,
         compute_device=scene.cycles.device,gpu_backend=args.gpu_backend,gpu_devices=gpu_devices,
         denoising=False,
