@@ -11,7 +11,12 @@ wheels/
 
 blender_affine_models/
 # EOGS_affine_models/
-output/
+output/**
+# keep the validation and simulation reports of the full run under version control
+!output/orbits_melbourne/
+!output/orbits_melbourne/eevee_full_1000/
+!output/orbits_melbourne/eevee_full_1000/validation_report.md
+!output/orbits_melbourne/eevee_full_1000/SIMULATION_DESCRIPTION.md
 data/
 OBJ/
 *.zip
