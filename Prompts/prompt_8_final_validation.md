@@ -3,7 +3,7 @@ Write and run scripts/validate_run.py, read-only on the outputs, and write
 validation_report.md in the run folder.
 
 Checks (report numbers, flag every failure with the frame and satellite):
-- exactly 7 satellite folders with 1000 frames each (frame_0000..0999), no gaps or duplicates;
+- exactly 5 satellite folders with 1000 frames each (frame_0000..0999), no gaps or duplicates;
 - every PNG opens, is RGBA, 8 bit, 4096x3072, and not truncated (file size > 0, decode ok);
 - alpha coverage per satellite: min / mean / max over frames; list frames with coverage 0;
 - poses: consecutive position differences equal |v|*dt (rel tol 1e-6) for every satellite;
