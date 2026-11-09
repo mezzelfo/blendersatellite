@@ -27,7 +27,7 @@ from PIL import Image
 import stacking_geometry as g
 
 TERRAIN = g.REPO / 'data/swarm_terrain'
-CYCLES_RUN = g.REPO / 'output/orbits_melbourne/20261106T080712Z_run_IxoFnH/renders'
+CYCLES_RUN = g.REPO / 'output/orbits_melbourne/20261109T180310Z_run_v2/renders'
 FRAMES = (0, 499, 999)
 H, W = g.HEIGHT, g.WIDTH
 

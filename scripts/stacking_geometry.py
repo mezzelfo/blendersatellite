@@ -54,7 +54,7 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parents[1]
 RUN_DIR = REPO / 'output/orbits_melbourne/eevee_full_1000'
-CAMERAS_JSON = REPO / 'output/orbits_melbourne/20261106T080712Z_run_IxoFnH/simulation/cameras.json'
+CAMERAS_JSON = REPO / 'output/orbits_melbourne/20261109T180310Z_run_v2/simulation/cameras.json'
 N_SATELLITES = 7
 N_FRAMES = 1000
 

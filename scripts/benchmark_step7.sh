@@ -12,7 +12,7 @@
 set -euo pipefail
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BLENDER_BIN="${BLENDER_BIN:-/snap/blender/current/blender}"
-CAMERAS="${CAMERAS:-$PROJECT_DIR/output/orbits_melbourne/20261106T080712Z_run_IxoFnH/simulation/cameras.json}"
+CAMERAS="${CAMERAS:-$PROJECT_DIR/output/orbits_melbourne/20261109T180310Z_run_v2/simulation/cameras.json}"
 TERRAIN="${TERRAIN:-$PROJECT_DIR/data/swarm_terrain}"
 BENCH="${1:-$PROJECT_DIR/output/orbits_melbourne/$(date -u +%Y%m%dT%H%M%SZ)_bench_step7}"
 shift || true

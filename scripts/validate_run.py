@@ -7,7 +7,7 @@ validation_summary.json) in the run folder. Nothing else is written.
 
 Run in the conda environment "orbits" (NumPy + Pillow), e.g.:
     python scripts/validate_run.py output/orbits_melbourne/eevee_full_1000 \
-        --simulation output/orbits_melbourne/20261106T080712Z_run_IxoFnH/simulation
+        --simulation output/orbits_melbourne/20261109T180310Z_run_v2/simulation
 """
 import argparse
 import datetime as dt_
