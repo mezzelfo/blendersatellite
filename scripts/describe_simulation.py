@@ -51,7 +51,7 @@ PROJ_TO_GEO = Transformer.from_crs(7855, 7844, always_xy=True)
 
 # ---------------------------------------------------------------- numerics (numpy, float64)
 def j2_acc(r):
-    """Same model as orbits/src/orbits/physics.py:23-30."""
+    """Same model as orbits/src/orbits/physics.py:34-41."""
     r2 = np.sum(r * r, -1, keepdims=True)
     a = -EARTH.mu * r / r2 ** 1.5
     z2 = r[..., 2:3] ** 2 / r2
@@ -82,9 +82,12 @@ def enu_axes(lon, lat):
 
 
 def chief_capture_recomputed(manifest):
-    """Chief ECI state at t_c, recomputed with the formulas of melbourne_overpass.py:107-141."""
+    """Chief ECI state at t_c, recomputed with the formulas of melbourne_overpass.py:77-102.
+
+    The geocentric radius is cameras.json a_chief_m (altitude reference of the run); older
+    manifests without it used |origin| + 500 km."""
     origin = np.asarray(manifest['origin_ecef_m'])
-    r_ecef = mo.unit(origin) * (np.linalg.norm(origin) + 500000)
+    r_ecef = mo.unit(origin) * manifest.get('a_chief_m', np.linalg.norm(origin) + 500000)
     radial = mo.unit(r_ecef)
     east_r = mo.unit(np.cross([0, 0, 1], radial)); north_r = np.cross(radial, east_r)
     inc = sso_inclination(float(np.linalg.norm(r_ecef)))
@@ -116,12 +119,17 @@ def measure():
     tc = float(manifest['capture_time_s'])
     capture = datetime.fromisoformat(manifest['capture_timestamp'])
     theta_c = mo.gmst(capture)
-    ecef_from_eci = lambda t: mo.rotation_z(theta_c + mo.GMST_RATE * (t - tc)).T   # melbourne_overpass.py:218
+    ecef_from_eci = lambda t: mo.rotation_z(theta_c + mo.GMST_RATE * (t - tc)).T   # melbourne_overpass.py:202
     M['time'] = dict(dt=dt, tc=tc, tc_over_dt=tc / dt, n=len(times), t_last=float(times[-1]),
                      dt_dev=float(np.max(np.abs(np.diff(times) - dt))),
                      start=epochs[0]['timestamp'], end=epochs[-1]['timestamp'], capture=manifest['capture_timestamp'],
                      dt_sensor=frame_period(500e3), gsd=gsd(500e3), vg=ground_speed(500e3),
                      footprint=footprint_m(500e3), window=float(times[-1] - times[0]))
+    fg = manifest['formation_geometry']
+    M['time'].update(mode=fg.get('frame_period_mode', 'nominal'),
+                     **{k: fg[k] for k in ('dt_pixel_rate_s', 'dt_closed_form_s', 'dt_nominal_s', 'rate_rows_per_s',
+                                           'rate_cols_per_s', 'v_target_m_s', 'rho_m', 'gsd_true_m', 'pixel_rate_delta_s',
+                                           'mean_radius_m', 'height_above_target_m', 'altitude_reference') if k in fg})
     # Chief at t_c: RK4 half step from the samples either side vs the recomputed chief_capture.
     cap, r_ecef_cap, inc_code = chief_capture_recomputed(manifest)
     fwd = rk4(states[499, 0], dt / 16, 8); back = rk4(states[500, 0], -dt / 16, 8)
@@ -277,10 +285,19 @@ def measure():
                 row[f'tot_{h:.0f}'] = best
             par.append(row)
     M['parallax'] = par
-    log = (SIM.parent / 'pipeline.log').read_text().splitlines()
-    i = next(i for i, l in enumerate(log) if l.startswith('Checked '))
-    worst = eval(log[i].split('worst: ', 1)[1], {'__builtins__': {}})   # dict literal printed by render_swarm.py:349
-    M['pipeline_line'] = i + 1
+    # Projection-check line printed by render_swarm.py:349: in the simulation pipeline.log, or (runs whose
+    # pipeline.log covers the simulation only) in the per-satellite render job logs of the run folder.
+    found = []
+    for path in [SIM.parent / 'pipeline.log'] + sorted((g._paths['run_dir'] / 'logs').glob('satellite_*.log')):
+        lines = path.read_text().splitlines() if path.exists() else []
+        i = next((i for i, l in enumerate(lines) if l.startswith('Checked ')), None)
+        if i is not None:
+            found.append((path, i, eval(lines[i].split('worst: ', 1)[1], {'__builtins__': {}})))  # dict literal
+        if found and path.name == 'pipeline.log':
+            break
+    worst = {k: max(f[2][k] for f in found) for k in ('corner_px', 'pixel_step_dev', 'target_px')}
+    worst['alignment'] = min(f[2]['alignment'] for f in found)
+    M['pipeline_line'] = ', '.join(f'{p.relative_to(g.REPO)}:{i + 1}' for p, i, _ in found)
     M['pipeline_worst'] = (f'corner {worst["corner_px"]:.6f} px, pixel step dev {worst["pixel_step_dev"]:.6f}, '
                            f'target {worst["target_px"]:.6f} px, alignment 1 - {1-worst["alignment"]:.1e}')
     import subprocess
@@ -307,16 +324,40 @@ def write(M, C, S, out):
 
     w('## 1. Time and orbit\n')
     w('| quantity | value | source |\n|---|---|---|')
-    w(f'| epoch of sample 0 (t = 0) | {T["start"]} | cameras.json epochs[0].timestamp; melbourne_overpass.py:215-219 |')
-    w(f'| capture instant t_c | {T["capture"]}, t_c = {T["tc"]:.12f} s = {T["tc_over_dt"]:.6f} dt | cameras.json capture_time_s; melbourne_overpass.py:132 |')
+    w(f'| epoch of sample 0 (t = 0) | {T["start"]} | cameras.json epochs[0].timestamp; melbourne_overpass.py:198-203 |')
+    w(f'| capture instant t_c | {T["capture"]}, t_c = {T["tc"]:.12f} s = {T["tc_over_dt"]:.6f} dt | cameras.json capture_time_s; melbourne_overpass.py:116 |')
     w(f'| last sample | {T["end"]}, t = {T["t_last"]:.12f} s | cameras.json epochs[999] |')
     w(f'| time grid | t_k = k dt, k = 0..{T["n"]-1}; max abs(diff(t) - dt) = {T["dt_dev"]:.2e} s | results.npz times; sensor_timing.py:38-41 |')
-    w(f'| dt | {T["dt"]*1e3:.13f} ms (sensor_timing.frame_period(500 km) = {T["dt_sensor"]*1e3:.13f} ms) | formation_distances.json; sensor_timing.py:32-35 |')
-    w(f'| dt definition | GSD / v_g = {T["gsd"]:.12f} m / {T["vg"]:.10f} m/s (nominal h = 500 km, Re = 6378137 m) | sensor_timing.py:20-35; melbourne_overpass.py:130 |')
-    w(f'| window | {T["window"]*1e3:.6f} ms ({T["n"]} samples) | results.npz |\n')
+    if T['mode'] == 'ground':
+        w(f'| dt | {T["dt"]*1e3:.10f} ms (frame_period_mode ground; nominal sensor_timing.frame_period(500 km) = '
+          f'{T["dt_sensor"]*1e3:.10f} ms, not used) | cameras.json frame_period_s; melbourne_overpass.py:106-122 |')
+        w(f'| dt definition (ground, used) | dt = 1 / rate_rows = 1 / {T["rate_rows_per_s"]:.6f} rows/s: the common target at t_c '
+          f'(chief boresight x WGS84, fixed to the Earth) projected into the chief camera at t_c -/+ {T["pixel_rate_delta_s"]:g} s, '
+          f'rate_rows = (row(+) - row(-)) / (2 delta), so the ground advances exactly one chief row per frame '
+          f'(rate_cols = {T["rate_cols_per_s"]:.2e} cols/s). Cross-check dt_closed_form = GSD_true / v_t = rho p / f / v_t = '
+          f'{T["dt_closed_form_s"]*1e3:.10f} ms (rho = {T["rho_m"]:.3f} m, GSD_true = {T["gsd_true_m"]:.9f} m, '
+          f'v_t = {T["v_target_m_s"]:.4f} m/s; relative difference '
+          f'{abs(T["dt_pixel_rate_s"]-T["dt_closed_form_s"])/T["dt_pixel_rate_s"]:.1e}) | '
+          f'orbits/src/orbits/burst_geometry.py:118-140 (pixel_rate_frame_period), 143-161 (closed_form_frame_period); '
+          f'melbourne_overpass.py:106-112, 118-122; cameras.json |')
+        w(f'| dt definition (nominal, not used) | GSD / v_g = {T["gsd"]:.12f} m / {T["vg"]:.10f} m/s (nominal h = 500 km, '
+          f'Re = 6378137 m) = {T["dt_sensor"]*1e3:.10f} ms | sensor_timing.py:20-35; melbourne_overpass.py:93 |')
+    else:
+        w(f'| dt | {T["dt"]*1e3:.13f} ms (sensor_timing.frame_period(500 km) = {T["dt_sensor"]*1e3:.13f} ms) | formation_distances.json; sensor_timing.py:32-35 |')
+        w(f'| dt definition | GSD / v_g = {T["gsd"]:.12f} m / {T["vg"]:.10f} m/s (nominal h = 500 km, Re = 6378137 m) | sensor_timing.py:20-35; melbourne_overpass.py:93 |')
+    w(f'| window | {T["window"]*1e3:.6f} ms ({T["n"]} samples) | results.npz |')
+    if 'mean_radius_m' in T:
+        w(f'| altitude reference | {T["altitude_reference"]}: R_avg = (2a + b)/3 (WGS84 a = 6378137.0, b = 6356752.314245) = '
+          f'{T["mean_radius_m"]:.4f} m | orbits/src/orbits/physics.py:8-11; melbourne_overpass.py:44-45, 79 |')
+        w(f'| a_chief | R_avg + 500 km = {M["a_chief"]:.4f} m, on the geocentric radial of the Melbourne point | '
+          f'cameras.json a_chief_m; melbourne_overpass.py:79-80, 89 |')
+        w(f'| height above the target | {T["height_above_target_m"]:.3f} m (a_chief - abs(Melbourne point), geocentric) | '
+          f'cameras.json height_above_target_m; melbourne_overpass.py:103-105 |')
+    w(f'| SSO inclination | sso_inclination(a_chief) = {M["inc_code"]:.6f} deg (J2 with the equatorial Re = 6378137 m) | '
+      f'elements.py:8-17; melbourne_overpass.py:90 |\n')
     w('Chief osculating elements (orbits.elements.eci_to_elements, elements.py:32-59; u = argp + nu). The state at t_c '
       'is integrated from sample 499 by dt/2 (RK4, 8 steps, same J2 model) and agrees with the chief_capture state rebuilt '
-      f'from melbourne_overpass.py:107-141 within {M["tc_state"]["fwd_vs_capture_m"]*1e3:.3g} mm '
+      f'from melbourne_overpass.py:77-102 within {M["tc_state"]["fwd_vs_capture_m"]*1e3:.3g} mm '
       f'(from sample 500 backwards: {M["tc_state"]["back_vs_capture_m"]*1e3:.3g} mm).\n')
     w('| element | t = 0 | t = t_c |\n|---|---|---|')
     for key, unit, n in (('a', 'm', 4), ('e', '', 10), ('i', 'deg', 9), ('raan', 'deg', 9), ('argp', 'deg', 6),
@@ -325,20 +366,20 @@ def write(M, C, S, out):
         w(f'| {key} {unit} | {a:.{n}f} | {b:.{n}f} |' if key != 'e' else f'| e | {a:.3e} | {b:.3e} |')
     w('')
     w(f'- At t_c the chief state is built exactly circular in the two-body sense (r perpendicular to v, |v| = sqrt(mu/r); '
-      'melbourne_overpass.py:137-141), hence a = r and e = 0 (argp = 0 by the circular convention, elements.py:55). '
+      'melbourne_overpass.py:97-102), hence a = r and e = 0 (argp = 0 by the circular convention, elements.py:55). '
       'The elements are two-body osculating elements of a J2 trajectory, so they carry the short-period J2 variation: '
       f'between t = 0 and t_c a changes by {M["elc"]["a"]-M["el0"]["a"]:+.3f} m and e by {M["elc"]["e"]-M["el0"]["e"]:+.2e}. '
       'With e ~ 1e-6, argp and nu are individually ill-defined; u = argp + nu is the meaningful angle.')
     w(f'- SSO inclination actually used: sso_inclination(a_chief) = {M["inc_code"]:.9f} deg for a_chief = '
-      f'{M["a_chief"]:.6f} m (melbourne_overpass.py:126-128, elements.py:8-17; pipeline.log prints the same value; '
+      f'{M["a_chief"]:.6f} m (melbourne_overpass.py:88-90, elements.py:8-17; pipeline.log prints the same value; '
       f'cameras.json formation_geometry.inclination_deg = {M["inc_manifest"]:.9f}). The osculating i at t = 0 '
       f'is {M["el0"]["i"]:.9f} deg (back-propagated state, config.yaml chief.inclination_deg).')
     w(f'- RAAN drift of the chief over 1 day of J2 propagation from the t = 0 state (RK4 10 s, linear fit of the '
       f'osculating RAAN): {M["raan_rate_deg_day"]:.5f} deg/day (target 0.9856 deg/day).')
     s = M['sub']
     w(f'- Satellite geodetic position at t_c (WGS84, pyproj EPSG:4978 -> 4979): lat {s["lat"]:.6f} deg, lon {s["lon"]:.6f} deg, '
-      f'h {s["h"]:.3f} m; geocentric radius {s["geocentric_r"]:.3f} m. The chief is placed 500 km along the GEOCENTRIC '
-      f'radial of the Melbourne point (melbourne_overpass.py:117): its geocentric nadir hits WGS84 at lat {s["nadir_lat"]:.6f}, '
+      f'h {s["h"]:.3f} m; geocentric radius {s["geocentric_r"]:.3f} m. The chief is placed at a_chief along the GEOCENTRIC '
+      f'radial of the Melbourne point (melbourne_overpass.py:79-80): its geocentric nadir hits WGS84 at lat {s["nadir_lat"]:.6f}, '
       f'lon {s["nadir_lon"]:.6f}, {s["nadir_to_origin_m"]:.3f} m from the Melbourne origin '
       f'(lat/lon {s["origin_lon_lat"][1]:.6f}, {s["origin_lon_lat"][0]:.6f}); the geodetic sub-satellite point is the '
       'satellite lat/lon above.')
@@ -348,24 +389,30 @@ def write(M, C, S, out):
     w(f'- Pass: {"ascending" if s["ascending"] else "descending"} (ECI v_z = {s["vz_eci"]:+.3f} m/s at t_c).')
     w(f'- Local mean solar time at the pass: {s["lmst"]} (UTC 00:00:00 + lon/15 h).')
     gs = M['ground_speed']
-    w(f'- Ground speed of the chief nadir point (= common target) on WGS84: {gs["mean"]:.4f} m/s '
-      f'(min {gs["min"]:.4f}, max {gs["max"]:.4f}), versus v_g = {T["vg"]:.4f} m/s used for dt '
-      f'(ratio {gs["mean"]/T["vg"]:.6f}).')
+    if T['mode'] == 'ground':
+        w(f'- Ground speed of the chief nadir point (= common target) on WGS84: {gs["mean"]:.4f} m/s '
+          f'(min {gs["min"]:.4f}, max {gs["max"]:.4f}), versus v_t = {T["v_target_m_s"]:.4f} m/s at t_c used for the '
+          f'closed-form cross-check of dt (ratio {gs["mean"]/T["v_target_m_s"]:.6f}); the nominal v_g = {T["vg"]:.4f} m/s '
+          f'is not used.')
+    else:
+        w(f'- Ground speed of the chief nadir point (= common target) on WGS84: {gs["mean"]:.4f} m/s '
+          f'(min {gs["min"]:.4f}, max {gs["max"]:.4f}), versus v_g = {T["vg"]:.4f} m/s used for dt '
+          f'(ratio {gs["mean"]/T["vg"]:.6f}).')
     ig = M['integrator']
-    w(f'- Propagator: point mass + J2 (orbits/src/orbits/physics.py:15-36; mu = 3.986004418e14, Re = 6378137 m, '
+    w(f'- Propagator: point mass + J2 (orbits/src/orbits/physics.py:14-41; mu = 3.986004418e14, Re = 6378137 m, '
       f'J2 = 1.08262668e-3), fixed-pole ECI, torchdiffeq odeint {ig["method"]} with rtol {ig["rtol"]}, atol {ig["atol"]} '
       f'(simulation config.yaml:{M["integrator_line"]}-{M["integrator_line"]+4}; cli.py:39-40, 62; propagation.py:21), '
       f'float64 on cuda:0, {T["n"]} output samples (dense output of the adaptive steps). The back-propagation of the chief '
-      'from t_c to t = 0 uses dopri5 with rtol 1e-11, atol 1e-10 (melbourne_overpass.py:145-146). Deputies are created at '
-      't = 0 with roe_to_eci (melbourne_overpass.py:190-192, roe.py:86-89).')
+      'from t_c to t = 0 uses dopri5 with rtol 1e-11, atol 1e-10 (melbourne_overpass.py:129-130). Deputies are created at '
+      't = 0 with roe_to_eci (melbourne_overpass.py:174-176, roe.py:86-89).')
     w(f'- Dense-output error (recomputed in this step): all 7 satellites, every sample versus an independent fixed-step '
       f'RK4 (step dt/4, numpy, same J2 model) started from sample 0: max position error {M["dense_err_m"]:.3e} m.\n')
 
     w('## 2. Formation\n')
     w(f'ROE (quasi-nonsingular, osculating, applied at t = 0 without mean/osculating conversion; roe.py:1-14). '
       f'The metre values are the specification (roe_hex7_dmax1km.json, generator roe.py:101-124). The dimensionless ROE '
-      f'used by the run are roe_m / a_chief = roe_m / {M["a_chief"]:.6f} (melbourne_overpass.py:190-192); the JSON '
-      f'"roe" field uses a_ref = {M["roe_a_ref"]} m (difference 7e-9 relative, not used). "Realised" = elements_to_roe of '
+      f'used by the run are roe_m / a_chief = roe_m / {M["a_chief"]:.6f} (melbourne_overpass.py:174-176); the JSON '
+      f'"roe" field uses a_ref = {M["roe_a_ref"]} m (relative difference {abs(M["roe_a_ref"]/M["a_chief"]-1):.1e}, not used). "Realised" = elements_to_roe of '
       'the propagated states at t = 0 times a_chief. da = dlam = 0 for every deputy.\n')
     w('| sat | (W, X) | a dex (m) | a dey (m) | a dix (m) | a diy (m) | dex | dey | dix | diy | realised max abs diff (m) |')
     w('|---|---|---|---|---|---|---|---|---|---|---|')
@@ -605,9 +652,14 @@ def results_and_limitations(M, C, st, V):
     fp = M['footprint']
     hdr = M['render_header']
     R = [
-        (1, 'GSD = h p / f', '4.741379310344828 m', f'{T["gsd"]:.15f} m', 'step 9 (sensor_timing.gsd)'),
-        (1, 'v_g', '7059.2164500563995 m/s', f'{T["vg"]:.10f} m/s', 'step 9 (sensor_timing.ground_speed)'),
-        (1, 'dt = GSD / v_g', '0.6716580152896355 ms', f'{T["dt"]*1e3:.16f} ms', 'step 9 (formation_distances.json, results.npz)'),
+        (1, 'nominal GSD = h p / f (h = 500 km)', '4.741379310344828 m', f'{T["gsd"]:.15f} m', 'step 9 (sensor_timing.gsd)'),
+        (1, 'nominal v_g (h = 500 km)', '7059.2164500563995 m/s', f'{T["vg"]:.10f} m/s', 'step 9 (sensor_timing.ground_speed)'),
+        *([(1, 'dt = 1 / rate_rows (frame_period_mode ground, step 10 D4)', '0.6661251071 ms', f'{T["dt"]*1e3:.10f} ms', 'step 9 (cameras.json frame_period_s, results.npz)'),
+           (1, 'dt closed form rho p / f / v_t', 'equal to dt within 1e-5 relative', f'{T["dt_closed_form_s"]*1e3:.10f} ms (rel diff {abs(T["dt_closed_form_s"]/T["dt"]-1):.1e})', 'cameras.json dt_closed_form_s'),
+           (1, 'a_chief = R_avg + 500 km (step 10 D1)', '6871008.7714 m', f'{M["a_chief"]:.4f} m', 'cameras.json a_chief_m'),
+           (1, 'SSO inclination at a_chief (step 10 D3)', 'about 97.3748 deg', f'{M["inc_code"]:.6f} deg', 'step 9 (sso_inclination)')]
+          if T['mode'] == 'ground' else
+          [(1, 'dt = GSD / v_g', '0.6716580152896355 ms', f'{T["dt"]*1e3:.16f} ms', 'step 9 (formation_distances.json, results.npz)')]),
         (1, 'nominal footprint across x along', '19420.7 x 14565.5 m', f'{T["footprint"][0]:.1f} x {T["footprint"][1]:.1f} m', 'step 9 (sensor_timing.footprint_m)'),
         (2, 'ROE metre table', 'PLAN_CONTEXT values', f'max dev {max(r["plan_dev"] for r in M["roe"]):.1e} m', 'step 9 (roe_hex7_dmax1km.json)'),
         (2, 'ROE realised at t = 0', 'equal to roe_m', f'max dev {max(max(abs(a-b) for a, b in zip(r["realised_m"], r["roe_m"])) for r in M["roe"]):.1e} m', 'step 9 (elements_to_roe of results.npz)'),
@@ -621,31 +673,53 @@ def results_and_limitations(M, C, st, V):
         (3, 'change of any pair distance over the window', '< 1 m', f'{M["pairs"]["max_change"]:.4f} m', 'step 9'),
         (3, '|dr| = |v| dt', 'rel 1e-6', f'max rel err {max(p["rel_err_max"] for p in s8["poses"]):.1e}', 'validation_summary.json poses'),
         (3, 'SSO RAAN drift', '0.9856 deg/day +/- 0.5%', f'{M["raan_rate_deg_day"]:.5f} deg/day ({(M["raan_rate_deg_day"]/0.9856-1)*100:+.2f}%)', 'step 9 (1-day J2 RK4)'),
-        (3, 'chief nadir ground speed', 'report vs v_g = 7059.216 m/s', f'{M["ground_speed"]["mean"]:.3f} m/s', 'step 9 (common_target_ecef_m)'),
+        (3, 'chief nadir ground speed', f'report vs v_t = {T["v_target_m_s"]:.3f} m/s at t_c' if T['mode'] == 'ground' else 'report vs v_g = 7059.216 m/s', f'{M["ground_speed"]["mean"]:.3f} m/s', 'step 9 (common_target_ecef_m)'),
         (3, 'bbox corner margin in the chief frame f0 / f999', '-734 / +387 m (from step 3, prompt_4_per_frame_poses.md:32)',
          f'{M["bbox_margin_m"][0]:+.1f} / {M["bbox_margin_m"][999]:+.1f} m', 'step 9'),
         (4, 'chief footprint across x along, f0 / f999', '19420.7 x 14565.5 m +/- 0.5%',
          f'{fp[0][0]:.1f} x {fp[0][1]:.1f} / {fp[999][0]:.1f} x {fp[999][1]:.1f} m', 'step 9 (cameras.json footprint_local_m)'),
-        (4, 'chief native GSD', '4.741 m +/- 0.1%', f'{D["native_gsd_m"][0].min():.6f} .. {D["native_gsd_m"][0].max():.6f} m', 'step 9 (poses.jsonl)'),
-        (4, 'chief ground advance per frame', '1.00 .. 1.02 px', f'{adv["ground_px"]["min"]:.5f} .. {adv["ground_px"]["max"]:.5f} px; image rows {st["advance"]["rows_min"]:.5f} .. {st["advance"]["rows_max"]:.5f}', 'validation_summary.json advance; step 9 (stacking_inputs.npz)'),
+        (4, 'chief native GSD', f'GSD_true = {T["gsd_true_m"]:.4f} m +/- 0.1%' if T['mode'] == 'ground' else '4.741 m +/- 0.1%', f'{D["native_gsd_m"][0].min():.6f} .. {D["native_gsd_m"][0].max():.6f} m', 'step 9 (poses.jsonl)'),
+        (4, 'chief ground advance per frame', '1 +/- 2e-5 px per frame (slant range changes ~15 m over the window)' if T['mode'] == 'ground' else '1.00 .. 1.02 px', f'{adv["ground_px"]["min"]:.5f} .. {adv["ground_px"]["max"]:.5f} px; image rows {st["advance"]["rows_min"]:.5f} .. {st["advance"]["rows_max"]:.5f}', 'validation_summary.json advance; step 9 (stacking_inputs.npz)'),
         (4, 'common target -> image centre', '< 0.01 px', f'max {max(v["max_px"] for v in C["target_centre"].values()):.1e} px (7 sats)', 'step 9; validation_summary.json target'),
         (4, 'deputy ground across alignment', '>= 1 - 1e-10', f'1 - {1-M["alignment_min"]:.1e}', 'step 9 (cameras.json)'),
         (4, 'selected tiles', '570', str(M['terrain']['tiles']), 'step 9 (cameras.json)'),
         (5, 'terrain caches', '570 valid .npz', f'{M["terrain"]["files"]} files, {M["terrain"]["tiles"]} selected present', 'step 9 (data/swarm_terrain)'),
         (5, 'triangle count', 'as loaded by the renderer', f'{M["terrain"]["triangles"]:,} (run header {hdr["triangles"]:,})', 'step 9; render_report.jsonl'),
-        (6, 'Blender projection checks (7000 poses)', 'corner < 0.1 px, GSD step < 0.002, target < 0.01 px',
-         M['pipeline_worst'], f'pipeline.log:{M["pipeline_line"]} (simulation run)'),
+        (6, 'Blender projection checks (every rendered pose)', 'corner < 0.1 px, GSD step < 0.002, target < 0.01 px',
+         M['pipeline_worst'], M['pipeline_line']),
         (6, 'render-time target error', '< 0.01 px', f'max {max(t["logged_max"] for t in s8["target"]):.2e} px', 'validation_summary.json target.logged_max'),
         (7, 'EEVEE render time per frame', 'n/a', f'{min(v["mean"] for v in s8["time"]["render_s"].values()):.2f} .. {max(v["mean"] for v in s8["time"]["render_s"].values()):.2f} s mean per satellite', 'validation_summary.json time.render_s'),
         (7, 'EEVEE minus Cycles brightness', 'about 0 (from step 7: about 0.4 DN)',
-         ', '.join(f'sat {r["sat"]} f{r["frame"]}: {r["mean_all"]:+.3f} DN' for r in ec), 'step 9 (Cycles PNGs in the simulation run folder, alpha = 255 in both)'),
+         ', '.join(f'sat {r["sat"]} f{r["frame"]}: {r["mean_all"]:+.3f} DN' for r in ec) if ec else
+         'not re-measured: no Cycles renders in this simulation run', 'step 9 (Cycles PNGs in the simulation run folder, alpha = 255 in both)'),
         (8, 'PNGs', '5000 valid RGBA 8-bit 4096x3072', f'{s8["png"]["ok"]} / {s8["png"]["checked"]}', 'validation_summary.json png'),
         (8, 'alpha coverage (alpha > 0.5)', 'non-zero every frame', f'{min(v["min"] for v in s8["coverage"].values())*100:.4f} .. {max(v["max"] for v in s8["coverage"].values())*100:.4f}%', 'validation_summary.json coverage'),
-        (8, 'chief phase correlation, vertical', 'about 1.01 px', f'{min(p["vertical"] for p in ph):.4f} px vs pose prediction {min(p["predicted_rows"] for p in ph):.4f}', 'validation_summary.json phase'),
+        (8, 'chief phase correlation, vertical', 'about 1.00 px' if T['mode'] == 'ground' else 'about 1.01 px', f'{min(p["vertical"] for p in ph):.4f} px vs pose prediction {min(p["predicted_rows"] for p in ph):.4f}', 'validation_summary.json phase'),
         (8, 'deputy vs chief image shift', 'small', f'up to {max(shifts):.2f} px; predicted from poses on terrain vertices within {pred_err:.2f} px', 'validation_summary.json overlap; step 9 (deputy_offsets)'),
         (8, 'verdict', 'PASS', s8['verdict'], 'validation_summary.json verdict'),
     ]
     dmax = max(abs(d['dchief'][k]) for d in M['distance'] for k in FRAMES)
+    pdev = [p['vertical'] - p['predicted_rows'] for p in ph]
+    phase_note = (f'Chief phase correlation (1/1000 px) measures {min(p["vertical"] for p in ph):.4f} .. '
+                  f'{max(p["vertical"] for p in ph):.4f} px; minus the pose prediction: {min(pdev):+.1e} .. {max(pdev):+.1e} px')
+    if max(abs(x) for x in pdev) >= 1e-3:
+        phase_note += (f', i.e. {"below" if np.mean(pdev) < 0 else "above"} the prediction, constant over the window '
+                       '(estimator bias on this scene, not a timing error; step 8).')
+    else:
+        phase_note += ', within the 1e-3 px resolution of the estimator (step 8).'
+    dep_rows = [r['rows'] for r in st['per_sat'] if r['sat'] != 0]
+    if T['mode'] == 'ground':
+        advance_note = (f'One clock for the swarm (step 10 D5): dt makes the chief advance '
+                        f'{st["advance"]["rows_min"]:.5f} .. {st["advance"]["rows_max"]:.5f} rows per frame (exactly 1 at t_c); '
+                        f'the deputies advance {min(r[0] for r in dep_rows):.5f} .. {max(r[1] for r in dep_rows):.5f} rows per '
+                        'frame in their own pixels (own range/GSD), reported, not corrected.')
+    else:
+        advance_note = (f'The chief ground advance is {st["advance"]["rows_min"]:.4f} .. {st["advance"]["rows_max"]:.4f} px per frame, not 1: '
+                        'dt is defined with the nominal 500 km, non-rotating spherical v_g, while the real ground motion includes Earth '
+                        f'rotation and the actual radius (chief nadir speed {M["ground_speed"]["mean"]:.2f} m/s on WGS84). Over 999 frames '
+                        f'the scene moves {np.sum(D["image_motion_rows_px"][0]):.1f} rows. The deputies advance at '
+                        f'{min(r["ratio"][0] for r in st["per_sat"]):.5f} .. {max(r["ratio"][1] for r in st["per_sat"]):.5f} times the '
+                        'chief rate in their own pixels (own GSD).')
     pmax = max(np.hypot(*p['tot_0'][0]) for p in M['parallax'])
     Lm = [
         'Terrain is a 2.5 m heightfield of the photomesh upper surface: no facades, overhangs, bridges underside or '
@@ -658,12 +732,12 @@ def results_and_limitations(M, C, st, V):
         'Footprints, ground pixel sizes, distance_m and native_gsd_m are on the local z = 0 tangent plane; the common target is '
         'on the WGS84 ellipsoid (z about -0.45 m at the target). The z = 0 plane departs from the ellipsoid by up to '
         f'{max(M["plane_height"]):.1f} m at the dataset corners. Terrain heights are AHD used as ellipsoidal height.',
-        f'EEVEE is about {np.mean([r["mean_all"] for r in ec]):.2f} DN brighter than Cycles on average over the opaque '
-        'pixels of the frames rendered with both engines (mean abs difference about '
-        f'{np.mean([r["mean_abs_DN"] for r in ec]):.1f} DN per channel).',
-        f'Chief phase correlation is {min(p["predicted_rows"] - p["vertical"] for p in ph):.4f} .. '
-        f'{max(p["predicted_rows"] - p["vertical"] for p in ph):.4f} px below the pose prediction, constant over the window '
-        '(estimator bias on this scene, not a timing error; step 8).',
+        (f'EEVEE is about {np.mean([r["mean_all"] for r in ec]):.2f} DN brighter than Cycles on average over the opaque '
+         'pixels of the frames rendered with both engines (mean abs difference about '
+         f'{np.mean([r["mean_abs_DN"] for r in ec]):.1f} DN per channel).') if ec else
+        'EEVEE vs Cycles brightness not re-measured on this run (no Cycles renders in the simulation run folder; '
+        'step 7 measured about +0.4 DN on the previous run).',
+        phase_note,
         f'Deputy images are shifted up to {max(shifts):.2f} px relative to the chief (step 8 phase correlation). The poses '
         f'predict the same shifts within {pred_err:.2f} px from the mean deputy-minus-chief position of terrain vertices: the '
         'shift is the scale difference (distance differs by up to '
@@ -671,18 +745,13 @@ def results_and_limitations(M, C, st, V):
         'off-centre and moves across the frame. It is geometry, not an error; use chief_to_satellite_pixel to co-register.',
         'Satellites 5 and 6 are propagated and have poses (cameras.json) but were not rendered; stacking_geometry reads '
         'their poses from cameras.json.',
-        f'The chief ground advance is {st["advance"]["rows_min"]:.4f} .. {st["advance"]["rows_max"]:.4f} px per frame, not 1: '
-        'dt is defined with the nominal 500 km, non-rotating spherical v_g, while the real ground motion includes Earth '
-        f'rotation and the actual radius (chief nadir speed {M["ground_speed"]["mean"]:.2f} m/s on WGS84). Over 999 frames '
-        f'the scene moves {np.sum(D["image_motion_rows_px"][0]):.1f} rows. The deputies advance at '
-        f'{min(r["ratio"][0] for r in st["per_sat"]):.5f} .. {max(r["ratio"][1] for r in st["per_sat"]):.5f} times the '
-        'chief rate in their own pixels (own GSD).',
+        advance_note,
         f'In the first {max(e["top_frames"] for e in st["alpha"]["extent"])} frames the dataset crosses the top image edge '
         '(alpha > 0 in row 0): part of the northern tiles is not imaged in those frames. Only '
         f'{st["alpha"]["extent"][0]["ri"]} rows contain the scene in every frame of the chief.',
         f'The chief boresight is the GEOCENTRIC nadir; it is {np.mean(M["geodetic_offnadir_deg"]):.4f} deg from the ellipsoid '
-        'normal at the target. The chief is placed 500 km along the geocentric radial (ellipsoidal height '
-        f'{M["sub"]["h"]:.2f} m).',
+        f'normal at the target. The chief is placed at a_chief = {M["a_chief"]:.4f} m along the geocentric radial '
+        f'(ellipsoidal height {M["sub"]["h"]:.2f} m).',
         'Earth orientation: fixed pole, GMST with UTC ~ UT1, no precession/nutation/polar motion; J2 only, no drag, '
         'no third bodies, no SRP (irrelevant over 0.67 s, but the absolute epoch geometry is approximate).',
         'ROE are osculating and applied directly at t = 0 (no mean/osculating map).',

@@ -213,6 +213,9 @@ def main():
     times, pos, vel = npz['times'], npz['positions_eci'], npz['velocities_eci']
     cams = json.loads((args.simulation / 'cameras.json').read_text())
     frame_period = cams['formation_geometry']['frame_period_s']
+    # 'ground': dt from the true pixel rate (chief exactly 1 row/frame); 'nominal' (or older manifests): 500 km formula
+    mode = cams.get('frame_period_mode', cams['formation_geometry'].get('frame_period_mode', 'nominal'))
+    report['frame_period_mode'] = mode
     dts = np.diff(times)
     report['time_grid'] = dict(n=len(times), dt=frame_period, dt_dev_max=float(np.max(np.abs(dts - frame_period))),
                                t0=float(times[0]), t_last=float(times[-1]))
@@ -314,7 +317,7 @@ def main():
                                    predicted_rows=float(pred[1]), predicted_cols=float(pred[0]),
                                    seconds=time.monotonic() - t0))
             if not 0.9 < abs(motion[0]) < 1.1:
-                failures.append(f'chief phase correlation {a}/{b}: vertical {motion[0]:+.4f} px, expected about 1.01')
+                failures.append(f'chief phase correlation {a}/{b}: vertical {motion[0]:+.4f} px, expected about {"1.00" if mode == "ground" else "1.01"}')
     report['phase'] = phase_rows
 
     # ---------------------------------------------------------------- same ground area across satellites
@@ -400,16 +403,25 @@ def main():
 
     # ---------------------------------------------------------------- extra notes
     adv = report.get('advance')
-    if adv and not 1.0 <= adv['image_norm']['mean'] <= 1.03:
+    if adv and mode == 'ground' and not abs(adv['image_norm']['mean'] - 1) < 1e-3:
+        notes.append(f"chief image advance {adv['image_norm']['mean']:.6f} px/frame, expected 1 +/- 1e-3 (frame_period_mode ground)")
+    if adv and mode != 'ground' and not 1.0 <= adv['image_norm']['mean'] <= 1.03:
         notes.append(f"chief image advance {adv['image_norm']['mean']:.4f} px/frame outside 1.00-1.03")
-    if adv:
+    if adv and mode == 'ground':
+        notes.append(f"chief ground advance {adv['ground_px']['mean']:.5f} px/frame, dt from the true ground speed "
+                     f"(frame_period_mode ground)")
+    elif adv:
         notes.append(f"chief ground advance {adv['ground_px']['mean']:.4f} px/frame (Earth rotation + real ground speed "
                      f"0.05% above v_g): expected, dt kept on purpose")
     if report['phase']:
-        dev = max(abs(p['vertical'] - p['predicted_rows']) for p in report['phase'])
-        notes.append(f'chief phase-correlation vertical shift is {min(p["vertical"] for p in report["phase"]):.4f} px, '
-                     f'up to {dev:.4f} px below the pose prediction (constant across the window: estimator bias, '
-                     f'not a timing error)')
+        devs = [p['vertical'] - p['predicted_rows'] for p in report['phase']]
+        dev = max(devs, key=abs)
+        side = 'above' if dev > 0 else 'below'
+        note = (f'chief phase-correlation vertical shift is {min(p["vertical"] for p in report["phase"]):.4f} px, '
+                f'up to {abs(dev):.4f} px {side} the pose prediction')
+        if abs(dev) >= 1e-3:
+            note += ' (constant across the window: estimator bias, not a timing error)'
+        notes.append(note)
     shifts = [np.hypot(v['shift_rows'], v['shift_cols']) for row in report['overlap'] for v in row['image'].values()]
     if shifts:
         notes.append(f'deputy-vs-chief image shift up to {max(shifts):.2f} px, drifting linearly over the window; '
@@ -517,7 +529,8 @@ def write_report(args, r, sat_ids, n_sim):
     for row in r['phase']:
         w(f'| {row["pair"][0]}/{row["pair"][1]} | {row["vertical"]:+.4f} | {row["across"]:+.4f} | '
           f'{row["predicted_rows"]:+.4f} / {row["predicted_cols"]:+.4f} | {np.hypot(row["vertical"], row["across"]):.4f} |')
-    w('\nExpected vertical about 1.01 px.\n')
+    w('\nExpected vertical about 1.00 px (frame_period_mode ground: dt makes the chief advance 1 row/frame).\n'
+      if r.get('frame_period_mode') == 'ground' else '\nExpected vertical about 1.01 px (frame_period_mode nominal).\n')
 
     w(f'## 7. Same ground area across satellites (every {args.sample_every}th frame)\n')
     w(f'Footprint overlap = area(deputy footprint ∩ chief footprint) / area(chief footprint), from cameras.json for all {n_sim} '

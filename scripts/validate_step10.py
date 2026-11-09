@@ -25,7 +25,8 @@ from validate_run import EDGE_NOMINAL_M, RING, SPOKES, rtn_tn  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 OLD_RUN = REPO / 'output/orbits_melbourne/eevee_full_1000'
-OLD_SIM = REPO / 'output/orbits_melbourne/20261106T080712Z_run_IxoFnH/simulation'
+# Old simulation (local altitude reference, nominal dt); regression_old reproduces 20261106T080712Z_run_IxoFnH bit for bit
+OLD_SIM = REPO / 'output/orbits_melbourne/step10_validation/regression_old/simulation'
 NEW_RUN = REPO / 'output/orbits_melbourne/step10_validation'
 
 
@@ -108,11 +109,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--new', type=Path, default=NEW_RUN, help='step-10 run folder (simulation/, renders_check/)')
     parser.add_argument('--simulation', default='simulation', help='simulation subfolder of --new')
+    parser.add_argument('--old-sim', type=Path, default=OLD_SIM, help='simulation folder of the old (pre-step-10) run')
     args = parser.parse_args()
     new_sim = args.new / args.simulation
     new_cams = json.loads((new_sim / 'cameras.json').read_text())
     new_form = json.loads((new_sim / 'formation_distances.json').read_text())
-    old_cams = json.loads((OLD_SIM / 'cameras.json').read_text())
+    old_cams = json.loads((args.old_sim / 'cameras.json').read_text())
     report = dict(
         old_timing=old_timing(),
         new_timing={k: new_cams[k] for k in ('altitude_reference', 'frame_period_mode', 'mean_radius_m', 'a_chief_m',
@@ -123,13 +125,13 @@ def main():
         old_run_frame_period_s=old_cams['formation_geometry']['frame_period_s'],
         tiles=dict(old=len(old_cams['selected_tiles']), new=len(new_cams['selected_tiles']),
                    identical=old_cams['selected_tiles'] == new_cams['selected_tiles']),
-        new_formation=formation(new_sim), old_formation=formation(OLD_SIM))
+        new_formation=formation(new_sim), old_formation=formation(args.old_sim))
     t = report['new_timing']
     report['dt_rel_diff_closed_form'] = abs(t['dt_pixel_rate_s'] - t['dt_closed_form_s']) / t['dt_pixel_rate_s']
     report['rate_cols_times_dt_px'] = abs(t['rate_cols_per_s']) * t['frame_period_s']
-    report['old_geometry'] = geometry(OLD_RUN, OLD_SIM / 'cameras.json')
+    report['old_geometry'] = geometry(OLD_RUN, args.old_sim / 'cameras.json')
     report['new_geometry'] = geometry(args.new, new_sim / 'cameras.json')
-    report['old_phase_0_50'] = phase(OLD_RUN / 'renders', 0, 50, OLD_RUN, OLD_SIM / 'cameras.json')
+    report['old_phase_0_50'] = phase(OLD_RUN / 'renders', 0, 50, OLD_RUN, args.old_sim / 'cameras.json')
     report['new_phase_0_50'] = phase(args.new / 'renders_check', 0, 50, args.new, new_sim / 'cameras.json')
     ch = report['new_geometry']['sats'][0]
     checks = dict(

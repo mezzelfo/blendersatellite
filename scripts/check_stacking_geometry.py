@@ -157,7 +157,11 @@ def alpha_and_cycles():
                                     median_lum_alpha_128_254=float(np.median(lum[(a >= 128) & (a < 255)])),
                                     median_lum_opaque=float(np.median(lum[a == 255])),
                                     partial_pixels=int(np.count_nonzero((a > 0) & (a < 255)))))
-    header = json.loads((CYCLES_RUN / 'render_report.jsonl').read_text().splitlines()[0])
+    report = CYCLES_RUN / 'render_report.jsonl'
+    if not report.exists():   # this simulation run has no Cycles renders: comparison skipped
+        out.update(cycles_header=None, eevee_minus_cycles=[])
+        return out
+    header = json.loads(report.read_text().splitlines()[0])
     out['cycles_header'] = {k: header.get(k) for k in ('engine', 'samples', 'compute_device', 'gpu_backend', 'blender_version')}
     rows = []
     for s, k in ((0, 0), (0, 499), (0, 500), (0, 999), (3, 999)):

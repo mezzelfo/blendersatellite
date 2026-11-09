@@ -5,15 +5,15 @@
 Notes:
 
 - 10 log lines are the Blender DeprecationWarning for Material.use_nodes (render_swarm.py:158, once per satellite run); benign until Blender 6.0
-- chief ground advance 1.0000 px/frame (Earth rotation + real ground speed 0.05% above v_g): expected, dt kept on purpose
-- chief phase-correlation vertical shift is 1.0000 px, up to 0.0000 px below the pose prediction (constant across the window: estimator bias, not a timing error)
+- chief ground advance 1.00001 px/frame, dt from the true ground speed (frame_period_mode ground)
+- chief phase-correlation vertical shift is 1.0000 px, up to 0.0000 px below the pose prediction
 - deputy-vs-chief image shift up to 0.66 px, drifting linearly over the window; consistent with each satellite having its own range/GSD (scale about the image centre while the scene crosses the frame); footprint and alpha IoU confirm the same ground area
 - only 12.0 GB free on the output volume
 - only satellites [0, 1, 2, 3, 4] rendered (5000 PNGs); propagation and formation checks include all 7 satellites
 
 Run folder: `/home/pareschi/Desktop/melbourne/blendersatellite/output/orbits_melbourne/eevee_full_1000`  
 Simulation: `/home/pareschi/Desktop/melbourne/blendersatellite/output/orbits_melbourne/20261109T180310Z_run_v2/simulation`  
-Generated 2026-11-09T21:55:43Z by `scripts/validate_run.py` in 5.0 min (read-only on the outputs).
+Generated 2026-11-09T22:18:29Z by `scripts/validate_run.py` in 5.1 min (read-only on the outputs).
 
 ## 1. Folders and frames
 
@@ -116,7 +116,7 @@ Frame 999: T-N 894.364 .. 894.490 m (max dev 0.063 m); 3D 896.546 .. 985.872 m.
 | 499/500 | +1.0000 | -0.0000 | +1.0000 / -0.0000 | 1.0000 |
 | 998/999 | +1.0000 | -0.0000 | +1.0000 / -0.0000 | 1.0000 |
 
-Expected vertical about 1.01 px.
+Expected vertical about 1.00 px (frame_period_mode ground: dt makes the chief advance 1 row/frame).
 
 ## 7. Same ground area across satellites (every 100th frame)
 

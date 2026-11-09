@@ -37,7 +37,7 @@ between the four central pixels. To read the PNG value at a continuous (r, c), u
 pixel np.rint(r), np.rint(c) (nearest neighbour) or bilinear interpolation on integer
 centres. Image-up (decreasing row) points along the chief's ECEF-relative velocity;
 ground features therefore move towards INCREASING PNG row as the frame index grows
-(+1.0102 rows per frame for the chief).
+(+1 row per frame for the chief, frame_period_mode ground).
 
 Inverse (pixel -> ray):
     u = (c + 1/2) / W,  v = 1 - (r + 1/2) / H
