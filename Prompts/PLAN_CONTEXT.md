@@ -101,3 +101,17 @@ plus a poses file per satellite. 7000 renders in total (5000 for satellites 0-4 
 - Everything runs on the cluster (Linux, CUDA, Blender 5.x, conda env "orbits").
 - Each step ends with a VERIFICATION REPORT: what was run, measured numbers versus
   expected ones, deviations, open problems. Then STOP and wait. Never start the next step.
+
+## Step 10 decisions (supersede "Chief radius" and the dt formula above for new runs)
+- D1. a_chief = R_avg + 500 km, R_avg = (2 a + b)/3 = 6371008.7714 m (WGS84 a = 6378137.0,
+  b = 6356752.314245) -> a_chief = 6871008.7714 m, on the geocentric radial of the Melbourne
+  point (about 500868 m above it). Constant orbits.physics.WGS84_MEAN_RADIUS (Earth().mean_radius).
+- D2. J2, Gravity, sso_inclination keep the equatorial radius Earth().radius = 6378137 m.
+- D3. Inclination = sso_inclination(a_chief) at the new a_chief (about 97.3748 deg).
+- D4. dt from the true geometry at t_c: the common target (fixed to the Earth) moves exactly
+  one chief row per frame (orbits.burst_geometry.pixel_rate_frame_period, central difference
+  +/- 10 ms); cross-check closed_form_frame_period = rho p / f / v_t.
+- D5. One clock for the swarm: the chief advances 1 row/frame; deputies 1 +/- ~1e-3 rows in
+  their own pixels (reported, not corrected).
+- Defaults of melbourne_overpass.py: --altitude-reference mean (local = old |origin| + 500 km),
+  --frame-period ground (nominal = old sensor_timing.frame_period(500 km)).
