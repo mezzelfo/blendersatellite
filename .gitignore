@@ -18,6 +18,9 @@ output/**
 !output/orbits_melbourne/eevee_full_1000/validation_report.md
 !output/orbits_melbourne/eevee_full_1000/SIMULATION_DESCRIPTION.md
 !output/orbits_melbourne/eevee_full_1000/stacking_inputs.npz
+# visual frame samples (scripts/export_frame_samples.py)
+!output/orbits_melbourne/eevee_full_1000/frame_samples/
+!output/orbits_melbourne/eevee_full_1000/frame_samples/**
 data/
 OBJ/
 *.zip
