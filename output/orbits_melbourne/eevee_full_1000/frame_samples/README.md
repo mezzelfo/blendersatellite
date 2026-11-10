@@ -19,11 +19,11 @@ by ~1000 rows.
 
 ## Files per (satellite, frame)
 
-- `*_full_q4.jpg` — whole 4096x3072 image, alpha composited on black, downscaled 1/4 (1024x768), JPEG q90.
-- `*_crop.png` — full-resolution 512x512 crop at a FIXED pixel window, box (left, top, right, bottom) = (1792, 1280, 2304, 1792), i.e. the image centre. Lossless: use it for pixel-level comparisons.
+- `full/*.jpg` — whole 4096x3072 image, alpha composited on black, downscaled 1/4 (1024x768), JPEG q90.
+- `crop/*.png` — full-resolution 512x512 crop at a FIXED pixel window, box (left, top, right, bottom) = (1792, 1280, 2304, 1792), i.e. the image centre. Lossless: use it for pixel-level comparisons.
 
 ## Layout
 
-- `by_satellite/satellite_XX/frame_NNNN_*` — real files (compare frames of one satellite).
-- `by_frame/frame_NNNN/satellite_XX_*` — relative symlinks to the above (compare satellites at one frame).
+- `by_satellite/satellite_XX/{full,crop}/frame_NNNN.{jpg,png}` — real files (compare frames of one satellite).
+- `by_frame/frame_NNNN/{full,crop}/satellite_XX.{jpg,png}` — relative symlinks to the above (compare satellites at one frame).
 - `contact_sheet_crop.jpg`, `contact_sheet_full.jpg` — overview grids, rows = satellites, columns = frames.

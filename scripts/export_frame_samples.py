@@ -4,13 +4,13 @@ Selection ("mixed: extremes + t_c"): frames 0,1,2 (start), 498..501 (around the
 capture instant t_c = 499.5 dt) and 997,998,999 (end), for every satellite.
 
 For each selected frame two files are written:
-  * <frame>_full_q4.jpg : whole image, alpha composited on black, downscaled 1/4, JPEG q90
-  * <frame>_crop.png    : full-resolution CROP x CROP window at a fixed pixel position
-                          (image centre by default), lossless PNG
+  * full/ : whole image, alpha composited on black, downscaled 1/4, JPEG q90
+  * crop/ : full-resolution CROP x CROP window at a fixed pixel position
+            (image centre by default), lossless PNG
 
 Layout of the output folder:
-  by_satellite/satellite_XX/frame_NNNN_{full_q4.jpg,crop.png}   (real files)
-  by_frame/frame_NNNN/satellite_XX_{full_q4.jpg,crop.png}        (relative symlinks)
+  by_satellite/satellite_XX/{full/frame_NNNN.jpg, crop/frame_NNNN.png}   (real files)
+  by_frame/frame_NNNN/{full/satellite_XX.jpg, crop/satellite_XX.png}     (relative symlinks)
   contact_sheet_crop.jpg / contact_sheet_full.jpg                (rows = satellites, cols = frames)
 
 Run (Pillow/numpy are not project dependencies):
@@ -64,7 +64,6 @@ def main() -> None:
     crop_box = None
     for s in sats:
         sat_dir = out / "by_satellite" / s
-        sat_dir.mkdir(parents=True, exist_ok=True)
         for f in FRAMES:
             rgb = to_rgb_on_black(renders / s / f"frame_{f:04d}.png")
             w, h = rgb.size
@@ -74,17 +73,16 @@ def main() -> None:
             small = rgb.resize((w // DOWNSCALE, h // DOWNSCALE), Image.LANCZOS)
             crop = rgb.crop(crop_box)
             stem = f"frame_{f:04d}"
-            small.save(sat_dir / f"{stem}_full_q4.jpg", quality=90)
-            crop.save(sat_dir / f"{stem}_crop.png", optimize=True)
             full_tiles[s, f], crop_tiles[s, f] = small, crop
-
-            frame_dir = out / "by_frame" / stem
-            frame_dir.mkdir(parents=True, exist_ok=True)
-            for kind in ("full_q4.jpg", "crop.png"):
-                link = frame_dir / f"{s}_{kind}"
+            for kind, ext, img, kw in (("full", "jpg", small, {"quality": 90}), ("crop", "png", crop, {"optimize": True})):
+                target = sat_dir / kind / f"{stem}.{ext}"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                img.save(target, **kw)
+                link = out / "by_frame" / stem / kind / f"{s}.{ext}"
+                link.parent.mkdir(parents=True, exist_ok=True)
                 if link.is_symlink() or link.exists():
                     link.unlink()
-                link.symlink_to(os.path.relpath(sat_dir / f"{stem}_{kind}", frame_dir))
+                link.symlink_to(os.path.relpath(target, link.parent))
             print(f"{s} {stem} done", flush=True)
 
     contact_sheet(crop_tiles, sats, FRAMES, 192, 192).save(out / "contact_sheet_crop.jpg", quality=90)
