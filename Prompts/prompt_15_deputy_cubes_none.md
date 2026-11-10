@@ -9,9 +9,10 @@ B. Validation (scripts/check_cubes.py)
 1. Checks B.1, B.2, B.6 of step 14 for every deputy.
 2. Band-to-band shift: phase correlation of slice b vs slice 0 (luminance x alpha), rows and
    columns, for every deputy and band. Prediction as in S9 (alpha-weighted mean of the per-pixel
-   z = 0 drift over the slice). Required for every band, with satellite 0 from
-   cubes/chief_shifts.json: |(measured_s - measured_0) - (predicted_s - predicted_0)| < 0.05 px.
-   Report also the raw |measured - predicted|. If the requirement fails, STOP and report.
+   z = 0 drift over the slice). Parallax term per band and layout from the chief in mode none
+   (S10): P_b = measured_0 - predicted_0, from cubes/chief_shifts.json. Required for every band:
+   |measured_s - predicted_s - P_b| < 0.05 px. Report also the raw |measured - predicted|.
+   If the requirement fails, STOP and report.
 3. Plot measured and predicted shift vs band row, one curve per satellite, both layouts
    (cubes/<layout>_none/preview/drift_vs_band.png). Expected: compact flat within about 0.03 px;
    diagnostic linear in the band row, last band of the order of step 13 C.5 (centre column 0.60,

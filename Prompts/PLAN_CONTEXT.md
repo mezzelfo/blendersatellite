@@ -158,3 +158,9 @@ S9. Shift predictions for whole slices are the alpha-weighted mean over the slic
     z = 0 drift, not the centre-column value. Terrain parallax (step 13 C.6: about 0.06 px band to
     band at 30 m in the diagnostic layout) is nearly the same for every satellite, so deputies are
     validated against the chief: (measured_s - measured_0) vs (predicted_s - predicted_0).
+S10. (step 14) The parallax reference is the chief in MODE NONE: P_b = measured_0 - predicted_0
+    per band and layout (cubes/chief_shifts.json; diagnostic band 7: +0.045 px, i.e. a mean
+    terrain height of about 22 m). The chief linear cube is not a reference: its correction is
+    below 0.03 px (about 0.2 DN) and uint8 rounding leaves 86% of the samples unchanged, so only
+    about 26% of the predicted shift survives. Deputies: none |measured - predicted - P_b| < 0.05 px,
+    linear |measured - P_b| < 0.02 px.
