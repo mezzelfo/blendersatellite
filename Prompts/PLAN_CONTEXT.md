@@ -150,3 +150,11 @@ S7. Outputs only under output/orbits_melbourne/eevee_full_1000/cubes/<layout>_<m
     cube_satSS.npz (cube [G, C, B, 4] uint8, g, cols, band_rows, frame index per (g, b): int for
     none, float k* for linear, metadata json). Report the expected size before writing
     (compact cube of the chief about 237 MB; 12 GB free on osiride).
+S8. (step 13) k* is computed per column (edge vs centre 0.05-0.08 px) and stored as float32
+    [G, C, B] in the linear cube file. The fitted slope s is in the satellite's frame-0 pixels;
+    image_motion_rows_px is in frame-(k+1) pixels: compare them only after the local scale J
+    (agreement 7e-9 px per frame, step 13 C.2).
+S9. Shift predictions for whole slices are the alpha-weighted mean over the slice of the per-pixel
+    z = 0 drift, not the centre-column value. Terrain parallax (step 13 C.6: about 0.06 px band to
+    band at 30 m in the diagnostic layout) is nearly the same for every satellite, so deputies are
+    validated against the chief: (measured_s - measured_0) vs (predicted_s - predicted_0).

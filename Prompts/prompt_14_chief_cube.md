@@ -8,6 +8,7 @@ A. Script scripts/build_cubes.py
   of the two frames around k* (linear), and only the scene columns of the satellite (S3).
   Parallel over frames; memory must stay well below the machine RAM (report the peak).
 - Writes cubes/<layout>_<mode>/cube_sat00.npz as in S7 and refuses to overwrite without --overwrite.
+  Linear mode: k* per column, float32 [G, C, B] in the same file (S8).
 - Print the expected size before writing and the wall time after.
 
 B. Validation (scripts/check_cubes.py, read-only on PNGs and cubes)
@@ -20,7 +21,10 @@ B. Validation (scripts/check_cubes.py, read-only on PNGs and cubes)
 3. Sensitivity: repeat 2 with a deliberate offset k = r_b - g + 1 and + 2. The statistics must grow
    clearly (state the ratio). If the correct index is not the minimum among offsets -2..+2, STOP.
 4. Phase correlation (scripts/phase_correlation.py method, luminance x alpha) of slice b vs slice 0:
-   shift rows / cols per band. Expected |shift| < 0.01 px for both layouts.
+   shift rows / cols per band, both modes. Compact: expected |shift| < 0.01 px. Diagnostic: report
+   measured vs the S9 prediction (mode none) and the residual (mode linear), no threshold: the
+   difference is the terrain-parallax term, the reference for steps 15-16 (S9). Save the per-band
+   chief shifts (both layouts and modes) to cubes/chief_shifts.json.
 5. none vs linear for the chief: max and mean |difference| (DN); expected tiny (drift 0.004 rows).
 6. Alpha: compare the alpha slices across bands (count of differing pixels).
 7. Previews in cubes/<layout>_<mode>/preview/: RGB of band 0 and of the last band (downsampled

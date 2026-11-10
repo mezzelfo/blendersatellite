@@ -8,12 +8,14 @@ A. Build cubes/<layout>_none/cube_sat01..04.npz with scripts/build_cubes.py.
 B. Validation (scripts/check_cubes.py)
 1. Checks B.1, B.2, B.6 of step 14 for every deputy.
 2. Band-to-band shift: phase correlation of slice b vs slice 0 (luminance x alpha), rows and
-   columns, for every deputy and band. Compare with the prediction of step 13 C.5 (same g range).
-   Required: |measured - predicted| < 0.05 px for every band. If not, STOP and report.
+   columns, for every deputy and band. Prediction as in S9 (alpha-weighted mean of the per-pixel
+   z = 0 drift over the slice). Required for every band, with satellite 0 from
+   cubes/chief_shifts.json: |(measured_s - measured_0) - (predicted_s - predicted_0)| < 0.05 px.
+   Report also the raw |measured - predicted|. If the requirement fails, STOP and report.
 3. Plot measured and predicted shift vs band row, one curve per satellite, both layouts
    (cubes/<layout>_none/preview/drift_vs_band.png). Expected: compact flat within about 0.03 px;
-   diagnostic linear in the band row, last band about +0.63 (sat 1), -0.11 (sat 2), -0.73 (sat 3),
-   -0.63 px (sat 4), i.e. 889 x (s - 1) with s from stacking_inputs.npz.
+   diagnostic linear in the band row, last band of the order of step 13 C.5 (centre column 0.60,
+   0.14, 0.76, 0.65 px for sats 1-4; signs from s - 1).
 4. Visual check, diagnostic layout, the satellite with the largest drift: crop of 200 x 200 px on
    a high-contrast area (pick it by gradient energy), first band, last band, and their difference
    amplified x10, side by side; also a GIF that cycles the 8 bands of that crop at 2 frames/s.

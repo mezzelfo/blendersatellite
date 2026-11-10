@@ -7,8 +7,10 @@ A. Build cubes/<layout>_linear/cube_sat01..04.npz with scripts/build_cubes.py (k
 
 B. Validation (scripts/check_cubes.py)
 1. Checks B.1, B.2, B.6 of step 14 for every deputy (B.1 with the recomputed interpolation).
-2. Residual band-to-band shift by phase correlation, every deputy and band. Required: < 0.02 px
-   in rows and columns. If not, STOP and report.
+2. Residual band-to-band shift by phase correlation, every deputy and band, rows and columns.
+   Required: compact |shift| < 0.02 px; diagnostic |shift_s - shift_0| < 0.02 px, with the chief
+   in linear mode from cubes/chief_shifts.json (the common term is terrain parallax, S9).
+   If not, STOP and report.
 3. Mode comparison per satellite and layout: table "max |shift| none | max |shift| linear |
    predicted none" and the mean |dRGB| of slice b vs slice 0 in the two modes.
 4. Interpolation smoothing: for each deputy, ratio of the gradient energy of slice 0 in linear vs
