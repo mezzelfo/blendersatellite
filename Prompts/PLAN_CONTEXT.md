@@ -164,3 +164,12 @@ S10. (step 14) The parallax reference is the chief in MODE NONE: P_b = measured_
     below 0.03 px (about 0.2 DN) and uint8 rounding leaves 86% of the samples unchanged, so only
     about 26% of the predicted shift survives. Deputies: none |measured - predicted - P_b| < 0.05 px,
     linear |measured - P_b| < 0.02 px.
+S11. (step 15) Plain phase correlation is biased towards whole-pixel shifts on these aliased renders
+    (pixel locking: residual up to +0.085 px at fractional shifts 0.2-0.4 px, sign change near 0.55).
+    Shift estimator for steps 14-16: Hann window + Gaussian low-pass on the normalised cross-power
+    spectrum, sigma chosen from a bias curve measured on KNOWN shifts, not from the geometric
+    residuals: take real cube slices (chief, both layouts), shift them by fractional amounts
+    0.0..1.0 px in steps of 0.05 (Fourier shift and bilinear shift, separately), and pick the
+    sigma whose max |bias| is below 0.005 px for both shift methods (candidates 0.15, 0.10, 0.08,
+    0.05 cycles/px). chief_shifts.json and P_b (S10) are recomputed with the same estimator.
+    Note for later: the same bias matters for inter-satellite registration at the 0.1 px level.
