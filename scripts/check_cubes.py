@@ -120,18 +120,19 @@ def main():
     ap.add_argument('--workers', type=int, default=20)
     ap.add_argument('--run', type=Path, default=sg.RUN_DIR)
     ap.add_argument('--samples', type=int, default=1000)
+    ap.add_argument('--modes', nargs='+', choices=MODES, default=list(MODES))
     ap.add_argument('--save-shifts', action='store_true', help='write cubes/chief_shifts.json (chief only)')
     args = ap.parse_args()
-    sat, run = args.satellite, args.run
-    cubes = {(l, m): load_cube(run, l, m, sat) for l in LAYOUTS for m in MODES}
-    n_frames = cubes['compact', 'none']['metadata']['n_frames']
-    cols = cubes['compact', 'none']['cols']
+    sat, run, modes = args.satellite, args.run, [m for m in MODES if m in args.modes]
+    cubes = {(l, m): load_cube(run, l, m, sat) for l in LAYOUTS for m in modes}
+    first = next(iter(cubes.values()))
+    n_frames, cols = first['metadata']['n_frames'], first['cols']
     for c in cubes.values():
         assert np.array_equal(c['cols'], cols) and c['metadata']['satellite'] == sat
-    all_rows = np.union1d(*[cubes[l, 'none']['band_rows'] for l in LAYOUTS])
+    all_rows = np.union1d(*[cubes[l, modes[0]]['band_rows'] for l in LAYOUTS])
     stack = read_png_rows(run, sat, all_rows, int(cols[0]), int(cols[-1]), n_frames, args.workers)
     rng = np.random.default_rng(14)
-    print(f'# Step 14 B: cube validation, satellite {sat}\n')
+    print(f'# Cube validation, satellite {sat}, modes {", ".join(modes)}\n')
     print(f'PNG rows read: {all_rows.size} rows x {cols.size} cols x {n_frames} frames '
           f'({stack.nbytes / 1e6:.0f} MB)\n')
 
@@ -163,7 +164,7 @@ def main():
           'pixels with identical RGB. Ratio = mean(o) / mean(0). Lines restricted to those valid for every o.\n')
     stop = []
     b23 = {}
-    for l in LAYOUTS:
+    for l in (LAYOUTS if 'none' in modes else ()):
         c = cubes[l, 'none']
         g, rows = c['g'], c['band_rows']
         ri = np.searchsorted(all_rows, rows)
@@ -183,8 +184,8 @@ def main():
                  ['argmin o'], table_rows))
         print()
     if stop:
-        print(f'**STOP: correct index is not the minimum for {stop}**')
-        return
+        print(f'**{"STOP: " if sat == 0 else ""}correct index is not the minimum for {stop}**')
+        if sat == 0: return
 
     # ---------------- B.4
     print('## B.4 Phase correlation of slice b vs slice 0 (luminance x alpha)\n')
@@ -196,9 +197,17 @@ def main():
                   prediction='S9: -(sum w (drift_b - drift_0)) / sum w, w = alpha_0 alpha_b / 255^2, drift = '
                              'frame-0 position of the z = 0 ground seen by the cube sample minus (g, c)',
                   layouts={})
+    # S10: parallax reference P_b = measured_0 - predicted_0 of the chief in mode none
+    chief_path = Path(run) / 'cubes' / 'chief_shifts.json'
+    chief = json.loads(chief_path.read_text()) if chief_path.exists() else None
+    tol = dict(none=0.05, linear=0.02)
+    failures = []
+    if chief is not None:
+        print(f'Parallax term P_b (S10) from {chief_path}. Requirement for deputies: none |meas - pred - P_b| < 0.05 px, '
+              'linear |meas - P_b| < 0.02 px (rows and cols).\n')
     for l in LAYOUTS:
         shifts['layouts'][l] = {}
-        for m in MODES:
+        for m in modes:
             c = cubes[l, m]
             g, rows, cube = c['g'], c['band_rows'], c['cube']
             dr, dc = drift_maps(sat, rows, cols, g, c['frame_index'], m, n_frames)
@@ -206,6 +215,15 @@ def main():
             out = dict(band_rows=rows.tolist(), measured_rows=[0.0], measured_cols=[0.0],
                        predicted_rows=[0.0], predicted_cols=[0.0])
             trs = []
+            if chief is not None:
+                cn = chief['layouts'][l]['none']
+                assert cn['band_rows'] == rows.tolist()
+                P = np.array([np.subtract(cn['measured_rows'], cn['predicted_rows']),
+                              np.subtract(cn['measured_cols'], cn['predicted_cols'])])
+            else:
+                P = np.zeros((2, rows.size))
+            out['parallax_rows'], out['parallax_cols'] = P[0].tolist(), P[1].tolist()
+            out['residual_rows'], out['residual_cols'] = [0.0], [0.0]
             for b in range(1, rows.size):
                 mot = -phase_shift(ref, gray(cube[:, :, b]), 1000)
                 w = cube[:, :, 0, 3].astype(float) * cube[:, :, b, 3] / 255 ** 2
@@ -213,26 +231,38 @@ def main():
                 pc = -np.sum(w * (dc[:, :, b] - dc[:, :, 0])) / w.sum()
                 out['measured_rows'].append(float(mot[0])); out['measured_cols'].append(float(mot[1]))
                 out['predicted_rows'].append(float(pr)); out['predicted_cols'].append(float(pc))
-                trs.append([b, rows[b], f'{mot[0]:+.4f}', f'{mot[1]:+.4f}', f'{pr:+.5f}', f'{pc:+.5f}',
-                            f'{mot[0] - pr:+.4f}', f'{mot[1] - pc:+.4f}'])
+                base = (pr, pc) if m == 'none' else (0.0, 0.0)
+                res = (mot[0] - base[0] - P[0, b], mot[1] - base[1] - P[1, b])
+                ok = max(abs(res[0]), abs(res[1])) < tol[m]
+                if sat != 0 and chief is not None and not ok: failures.append((l, m, b, res))
+                out['residual_rows'].append(float(res[0])); out['residual_cols'].append(float(res[1]))
+                trs.append([b, rows[b], f'{mot[0]:+.4f}', f'{mot[1]:+.4f}', f'{pr:+.4f}', f'{pc:+.4f}',
+                            f'{abs(mot[0] - pr):.4f}', f'{abs(mot[1] - pc):.4f}', f'{P[0, b]:+.4f}', f'{P[1, b]:+.4f}',
+                            f'{res[0]:+.4f}', f'{res[1]:+.4f}', '-' if sat == 0 else ('yes' if ok else '**NO**')])
             shifts['layouts'][l][m] = out
+            sd = Path(run) / 'cubes' / f'{l}_{m}'
+            (sd / f'shifts_sat{sat:02d}.json').write_text(json.dumps(dict(shifts, layouts={l: {m: out}}), indent=1))
             mr, mc = np.abs(out['measured_rows']).max(), np.abs(out['measured_cols']).max()
             print(f'### {l} {m}: max |motion| rows {mr:.4f}, cols {mc:.4f}' +
                   (f" ({'< 0.01 px: yes' if max(mr, mc) < 0.01 else '>= 0.01 px'})" if l == 'compact' else '') + '\n')
             if l == 'diagnostic' or b < 40:
-                print(md(['b', 'row', 'meas rows', 'meas cols', 'pred rows', 'pred cols', 'meas - pred rows',
-                          'meas - pred cols'], trs))
+                print(md(['b', 'row', 'meas rows', 'meas cols', 'pred rows', 'pred cols', '|meas-pred| rows',
+                          '|meas-pred| cols', 'P_b rows', 'P_b cols', 'residual rows', 'residual cols',
+                          f'< {tol[m]} px'], trs))
             print()
     if args.save_shifts:
         if sat != 0: raise SystemExit('--save-shifts is for the chief only')
         path = Path(run) / 'cubes' / 'chief_shifts.json'
         path.write_text(json.dumps(shifts, indent=1))
         print(f'saved {path}\n')
+    if failures:
+        print(f'**STOP: requirement failed for {len(failures)} (layout, mode, band): {failures}**')
+        return
 
     # ---------------- B.5
     print('## B.5 none vs linear (common lines)\n')
     tr = []
-    for l in LAYOUTS:
+    for l in (LAYOUTS if len(modes) == 2 else ()):
         a, b = cubes[l, 'none'], cubes[l, 'linear']
         common = np.intersect1d(a['g'], b['g'])
         A = a['cube'][np.searchsorted(a['g'], common)].astype(np.int16)
