@@ -173,3 +173,27 @@ S11. (step 15) Plain phase correlation is biased towards whole-pixel shifts on t
     sigma whose max |bias| is below 0.005 px for both shift methods (candidates 0.15, 0.10, 0.08,
     0.05 cycles/px). chief_shifts.json and P_b (S10) are recomputed with the same estimator.
     Note for later: the same bias matters for inter-satellite registration at the 0.1 px level.
+
+## Acquisition cube (step 17, decided 11 November 2026)
+
+Separate experiment from steps 13-16: every detector row that sees the scene in all frames is a
+band, and each band image stacks that row over the 1000 frames (maximum along-track length per
+band). No correction of any kind: the deputy drift stays in the data so it can be seen.
+
+F1. Satellites 0-4. Common rows 1000..1957 (958 bands) and columns 662..2569 (1908) for every
+    satellite, so band b is the same detector row in every satellite.
+F2. Cube D[b, k, c, RGBA] uint8 = frame_k[1000 + b, 662 + c], shape (958, 1000, 1908, 4), about
+    7.3 GB per satellite, 36.6 GB in total (space freed on osiride). Stored as .npy (open_memmap)
+    in output/orbits_melbourne/eevee_full_1000/cubes/acquisition/cube_satSS.npy + .json.
+F3. For the chief D[b, k] sees the ground line g = r_b - k (row in frame 0); two bands see the same
+    ground at frame offset delta = r_b2 - r_b1. For a deputy g is about r_b - s k, so after the
+    integer offset a residual of delta x (s - 1) remains (up to about 0.8 px for delta = 957).
+F4. Export subset: 9 bands at rows round(linspace(1000, 1957, 9)) = 1000, 1120, 1239, 1359, 1478,
+    1598, 1718, 1837, 1957, as PNG (1908 x 1000, image row = frame k) in
+    output/orbits_melbourne/eevee_full_1000/band_samples/, made visible to git by a .gitignore
+    exception (like frame_samples/). Each file < 50 MB (GitHub warns at 50 MB, rejects at 100 MB).
+F5. In a band image, going down (increasing k) the ground goes forward: the along-track
+    orientation is opposite to a single frame.
+F6. Validation of the deputy drift uses the S11 estimator and the S10 parallax logic, on band pairs.
+F7. Visual products (crops and GIF on the ground common to bands 1000 and 1957, 43 frames) go in
+    band_samples/comparison/ and are exported with the bands.
