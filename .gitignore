@@ -21,6 +21,9 @@ output/**
 # visual frame samples (scripts/export_frame_samples.py)
 !output/orbits_melbourne/eevee_full_1000/frame_samples/
 !output/orbits_melbourne/eevee_full_1000/frame_samples/**
+# band samples of the acquisition cube (scripts/build_acquisition_cube.py, step 17)
+!output/orbits_melbourne/eevee_full_1000/band_samples/
+!output/orbits_melbourne/eevee_full_1000/band_samples/**
 data/
 OBJ/
 *.zip

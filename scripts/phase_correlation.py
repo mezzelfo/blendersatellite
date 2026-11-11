@@ -34,10 +34,23 @@ def upsampled_dft(data, region, factor, offsets):
     return row_kernel @ data @ col_kernel
 
 
-def phase_shift(ref, mov, factor=1000):
-    """Shift s (rows, cols) such that mov(x) ~ ref(x + s); scene motion is -s."""
+def phase_shift(ref, mov, factor=1000, sigma=None, hann=False):
+    """Shift s (rows, cols) such that mov(x) ~ ref(x + s); scene motion is -s.
+
+    Default: plain phase correlation. On aliased renders it is biased towards whole-pixel
+    shifts (pixel locking, PLAN_CONTEXT S11). sigma (cycles/px) multiplies the normalised
+    cross-power spectrum by a Gaussian low-pass exp(-(fr^2 + fc^2) / (2 sigma^2)); hann
+    applies a separable Hann window to both images first. See phase_shift_s11.
+    """
+    if hann:
+        w = np.outer(np.hanning(ref.shape[0]), np.hanning(ref.shape[1]))
+        ref, mov = ref * w, mov * w
     cross = np.fft.fft2(ref) * np.conj(np.fft.fft2(mov))
     cross /= np.maximum(np.abs(cross), 1e-15)
+    if sigma is not None:
+        fr = np.fft.fftfreq(ref.shape[0])[:, None]
+        fc = np.fft.fftfreq(ref.shape[1])[None, :]
+        cross *= np.exp(-(fr ** 2 + fc ** 2) / (2 * sigma ** 2))
     corr = np.fft.ifft2(cross)
     peak = np.array(np.unravel_index(np.argmax(np.abs(corr)), corr.shape), dtype=float)
     mid = np.array(corr.shape) // 2
