@@ -1,0 +1,17 @@
+{
+  "melbourne_2020": {
+    "description": "City of Melbourne 3D Textured Mesh (Photomesh) 2020, one OBJ ZIP per grid cell",
+    "license": "CC BY 4.0, City of Melbourne",
+    "format": "obj_zip",
+    "url": "https://gis-3dmodelcapture-2020.s3.ap-southeast-2.amazonaws.com/photomesh/OBJ/{tile}.zip",
+    "projected_epsg": 7855,
+    "geographic_epsg": 7844,
+    "vertical": "AHD, used as approximate ellipsoidal height downstream",
+    "index": {
+      "type": "arcgis",
+      "url": "https://services1.arcgis.com/KGdHCCUjGBpOPPac/arcgis/rest/services/Photomesh_2020_OBJ_Grid/FeatureServer/0/query?where=1%3D1&outFields=Region&returnGeometry=true&outSR=7855&f=json",
+      "id_field": "Region",
+      "local_copy": "data/melbourne_tile_grid.json"
+    }
+  }
+}

@@ -217,7 +217,8 @@ def main():
     export_rows()
     bdir = band_dir(run)
     bdir.mkdir(exist_ok=True)
-    (bdir / 'README.md').write_text(README)
+    if not (bdir / 'README.md').exists():          # keep the hand-written README (band_samples/README.md)
+        (bdir / 'README.md').write_text(README)
     total = 0
     print('| sat | band row | file | size (MB) |\n|---|---|---|---|')
     for s in args.satellites:
