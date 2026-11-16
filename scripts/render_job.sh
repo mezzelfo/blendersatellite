@@ -23,6 +23,18 @@ if [[ -z "${TERRAIN:-}" ]]; then
     fi
 fi
 OUTPUT="${OUTPUT:-$PROJECT_DIR/output/orbits_melbourne/eevee_full_1000/renders}"
+# eevee_full_1000 is a frozen experiment rendered with the legacy terrain: refuse to add frames
+# to it with any other terrain (the colours differ, see README "Terrain data").
+EEVEE_FULL="$PROJECT_DIR/output/orbits_melbourne/eevee_full_1000"
+output_real="$(realpath -m -- "$OUTPUT")"
+if [[ "$output_real" == "$(realpath -m -- "$EEVEE_FULL")" || "$output_real" == "$(realpath -m -- "$EEVEE_FULL")"/* ]] \
+        && [[ "$(realpath -m -- "$TERRAIN")" != "$(realpath -m -- "$EEVEE_FULL/terrain_render_legacy")" ]]; then
+    echo "Output $OUTPUT is inside eevee_full_1000, a frozen experiment rendered with" >&2
+    echo "$EEVEE_FULL/terrain_render_legacy, but TERRAIN is $TERRAIN." >&2
+    echo 'Mixing terrains in one experiment is not allowed: choose another output folder (OUTPUT=...)' >&2
+    echo "or set TERRAIN=$EEVEE_FULL/terrain_render_legacy." >&2
+    exit 1
+fi
 FRAMES="${FRAMES:-0:1000}"
 NVSMI_GPU="$1"; SATELLITES="$2"; MODE="${3:-}"
 # Vulkan enumerates the two TITAN Xp in the opposite order of nvidia-smi on osiride

@@ -120,8 +120,8 @@ python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl
 `--gpu-devices 0` selects one Cycles GPU instead of both. Orbit metadata and
 `render_report.json` record the actual selected devices. Terrain preparation
 runs on the CPU: `TERRAIN_WORKERS` (default 4) sets the number of
-`terrain_cache.py` processes and `TERRAIN_SPACING` (default `1`, written as in
-the folder name, e.g. `1` or `2.5`) the cache spacing in metres;
+`terrain_cache.py` processes and `TERRAIN_SPACING` (default `1`; `1`, `1.0` and
+`1.00` all use the same `1m/` cache folder) the cache spacing in metres;
 `MELBOURNE_ARCHIVES=/path/to/zips` reuses already downloaded ZIPs. GPU denoising
 is disabled for these small previews so it does not introduce an unsupported
 CPU denoising pass.

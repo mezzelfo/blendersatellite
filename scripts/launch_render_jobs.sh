@@ -11,12 +11,27 @@
 set -euo pipefail
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT="${OUTPUT:-$PROJECT_DIR/output/orbits_melbourne/eevee_full_1000/renders}"
+CAMERAS="${CAMERAS:-$PROJECT_DIR/output/orbits_melbourne/20261109T180310Z_run_v2/simulation/cameras.json}"
+# Same TERRAIN default as render_job.sh (<run of CAMERAS>/terrain_render), resolved here for the guard.
+TERRAIN="${TERRAIN:-$(dirname -- "$(dirname -- "$CAMERAS")")/terrain_render}"
+# eevee_full_1000 is a frozen experiment rendered with the legacy terrain: refuse to add frames
+# to it with any other terrain (the colours differ, see README "Terrain data").
+EEVEE_FULL="$PROJECT_DIR/output/orbits_melbourne/eevee_full_1000"
+output_real="$(realpath -m -- "$OUTPUT")"
+if [[ "$output_real" == "$(realpath -m -- "$EEVEE_FULL")" || "$output_real" == "$(realpath -m -- "$EEVEE_FULL")"/* ]] \
+        && [[ "$(realpath -m -- "$TERRAIN")" != "$(realpath -m -- "$EEVEE_FULL/terrain_render_legacy")" ]]; then
+    echo "Output $OUTPUT is inside eevee_full_1000, a frozen experiment rendered with" >&2
+    echo "$EEVEE_FULL/terrain_render_legacy, but TERRAIN is $TERRAIN." >&2
+    echo 'Mixing terrains in one experiment is not allowed: choose another output folder (OUTPUT=...)' >&2
+    echo "or set TERRAIN=$EEVEE_FULL/terrain_render_legacy." >&2
+    exit 1
+fi
 JOBS="${JOBS:-0:0 1;0:2 3;1:4 5;1:6}"
 JOB="$PROJECT_DIR/scripts/render_job.sh"
 LOGS="$(dirname -- "$OUTPUT")/logs"
 # Step 7 benchmark: 8.159 MB mean PNG (8.143-8.173 MB); 1000 frames per satellite.
 PNG_BYTES=8159000
-export OUTPUT
+export OUTPUT CAMERAS TERRAIN
 IFS=';' read -r -a jobs <<< "$JOBS"
 if [[ "${1:-}" == --check-only ]]; then
     for job in "${jobs[@]}"; do "$JOB" "${job%%:*}" "${job#*:}" --check-only; done
@@ -39,14 +54,14 @@ echo
 echo "# Option 1: tmux (attach with: tmux attach -t render_job0)"
 i=0
 for job in "${jobs[@]}"; do
-    echo "tmux new-session -d -s render_job$i \"OUTPUT='$OUTPUT' '$JOB' ${job%%:*} '${job#*:}' 2>&1 | tee -a '$LOGS/job$i.log'\""
+    echo "tmux new-session -d -s render_job$i \"OUTPUT='$OUTPUT' CAMERAS='$CAMERAS' TERRAIN='$TERRAIN' '$JOB' ${job%%:*} '${job#*:}' 2>&1 | tee -a '$LOGS/job$i.log'\""
     i=$((i+1))
 done
 echo
 echo "# Option 2: nohup"
 i=0
 for job in "${jobs[@]}"; do
-    echo "OUTPUT='$OUTPUT' nohup '$JOB' ${job%%:*} '${job#*:}' >> '$LOGS/job$i.log' 2>&1 &"
+    echo "OUTPUT='$OUTPUT' CAMERAS='$CAMERAS' TERRAIN='$TERRAIN' nohup '$JOB' ${job%%:*} '${job#*:}' >> '$LOGS/job$i.log' 2>&1 &"
     i=$((i+1))
 done
 echo

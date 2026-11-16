@@ -55,12 +55,15 @@ conda run --no-capture-output -n orbits python scripts/melbourne_overpass.py \
     --train-spacing-m "$TRAIN_SPACING_M"
 # Terrain: native-CRS cache shared by every run (downloads only the missing tiles), then the
 # render grids in this run's local frame (<run>/terrain_render).
+# Cache folder name formatted exactly as terrain_cache.py does (1, 1.0 and 1.00 -> 1m).
+TERRAIN_CACHE_DIR="$PROJECT_DIR/data/terrain/melbourne_2020/$(conda run -n orbits python -c \
+    "import sys; print(f'{float(sys.argv[1]):g}m')" "$TERRAIN_SPACING")"
 conda run --no-capture-output -n orbits python "$PROJECT_DIR/terrain_cache.py" \
     --dataset melbourne_2020 --tiles-from "$ORBITS_RUN_DIR/cameras.json" \
     --spacing "$TERRAIN_SPACING" --workers "${TERRAIN_WORKERS:-4}" ${ARCHIVE_OPTS[@]+"${ARCHIVE_OPTS[@]}"}
 conda run --no-capture-output -n orbits python "$PROJECT_DIR/terrain_to_render.py" \
     --cameras "$ORBITS_RUN_DIR/cameras.json" \
-    --cache "$PROJECT_DIR/data/terrain/melbourne_2020/${TERRAIN_SPACING}m" --dataset melbourne_2020
+    --cache "$TERRAIN_CACHE_DIR" --dataset melbourne_2020
 "$MELBOURNE_BLENDER_BIN" --background --factory-startup --python-exit-code 1 \
     --python "$PROJECT_DIR/render_swarm.py" -- \
     --cameras "$ORBITS_RUN_DIR/cameras.json" --terrain "$RUN_DIR/terrain_render" \
