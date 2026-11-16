@@ -25,7 +25,12 @@ Output per tile, arrays indexed [row, col] with row 0 at the SOUTH edge
 
 Example (Melbourne, tiles chosen by an existing simulation):
   python terrain_cache.py --dataset melbourne_2020 --spacing 1.0 \\
-      --tiles-from output/.../simulation/cameras.json --output data/terrain_cache --workers 4
+      --tiles-from output/.../simulation/cameras.json --workers 4
+  (tiles in data/terrain/melbourne_2020/1m/, dataset.json and tile_grid.json one level up)
+
+log.jsonl in the tile folder gets one line per tile as soon as that tile is written. To
+recreate missing lines from the .npz files present (download fields left null):
+  python terrain_cache.py --dataset melbourne_2020 --spacing 1.0 --rebuild-log
 """
 import argparse
 import io
@@ -34,7 +39,7 @@ import shutil
 import time
 import urllib.request
 import zipfile
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -313,6 +318,55 @@ def tile_index(dataset, root=HERE):
             for f in payload['features']}
 
 
+def describe_dataset(name, dataset, dataset_dir, root=HERE):
+    """Write <output>/<dataset>/dataset.json and tile_grid.json (the index of the tiles).
+
+    tile_grid.json is copied from the index local_copy if present, otherwise downloaded;
+    a failed download only prints a warning, since the tiles do not depend on it.
+    """
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    (dataset_dir / 'dataset.json').write_text(json.dumps(dict(name=name, **dataset), indent=2) + '\n')
+    grid = dataset_dir / 'tile_grid.json'
+    if grid.exists():
+        return
+    spec = dataset.get('index', {})
+    local = root / spec['local_copy'] if spec.get('local_copy') else None
+    try:
+        if local is not None and local.exists():
+            shutil.copyfile(local, grid)
+        elif spec.get('url'):
+            download(spec['url'], grid)
+    except Exception as error:
+        print(f'warning: tile index not saved ({error!r})', flush=True)
+
+
+def rebuild_log(output_dir):
+    """Add a log.jsonl line for every .npz in output_dir that has none; return (kept, added).
+
+    Existing lines are kept unchanged and in order. Rebuilt lines hold what the .npz still
+    tells (shape, covered fraction, cache bytes, faces = null); download and timing fields are null.
+    """
+    log = output_dir / 'log.jsonl'
+    lines = log.read_text().splitlines() if log.exists() else []
+    logged = {json.loads(line)['tile'] for line in lines if line.strip()}
+    added = []
+    for path in sorted(output_dir.glob('*.npz')):
+        tile = path.stem
+        if tile in logged:
+            continue
+        with np.load(path) as data:
+            height = data['height']
+        added.append(dict(tile=tile, shape=list(height.shape), faces=None,
+                          covered_fraction=float(np.isfinite(height).mean()), archive_bytes=None,
+                          downloaded_bytes=None, cache_bytes=path.stat().st_size,
+                          download_s=None, total_s=None, rebuilt=True))
+    if added:
+        with log.open('a') as stream:
+            for record in added:
+                stream.write(json.dumps(record) + '\n')
+    return len(lines), len(added)
+
+
 def select_tiles(args, dataset):
     if args.tiles:
         return list(args.tiles)
@@ -331,12 +385,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--dataset', required=True, help='key in terrain_datasets.json')
     which = parser.add_mutually_exclusive_group(required=True)
+    which.add_argument('--rebuild-log', action='store_true',
+                       help='only add log.jsonl lines for cached tiles that have none, then exit')
     which.add_argument('--tiles', nargs='+', help='explicit tile ids')
     which.add_argument('--tiles-from', type=Path, help="cameras.json with 'selected_tiles'")
     which.add_argument('--bbox', type=float, nargs=4, metavar=('XMIN', 'YMIN', 'XMAX', 'YMAX'),
                        help='tiles intersecting a box in the dataset projected CRS')
     which.add_argument('--all', action='store_true', help='every tile in the dataset index')
-    parser.add_argument('--output', type=Path, default=HERE / 'data' / 'terrain_cache')
+    parser.add_argument('--output', type=Path, default=HERE / 'data' / 'terrain',
+                        help='root folder; tiles go to <output>/<dataset>/<spacing>m/')
     parser.add_argument('--spacing', type=float, default=1.0, help='output cell size in metres')
     parser.add_argument('--supersample', type=int, default=4, help='sub-cells per output cell along each axis')
     parser.add_argument('--archives', type=Path, help='directory with already downloaded ZIPs to reuse')
@@ -347,8 +404,12 @@ def main():
     args = parser.parse_args()
 
     dataset = load_datasets()[args.dataset]
-    tiles = select_tiles(args, dataset)[:args.limit]
     output_dir = args.output / args.dataset / f'{args.spacing:g}m'
+    if args.rebuild_log:
+        kept, added = rebuild_log(output_dir)
+        print(f'{output_dir / "log.jsonl"}: {kept} lines kept, {added} rebuilt', flush=True)
+        return
+    tiles = select_tiles(args, dataset)[:args.limit]
     output_dir.mkdir(parents=True, exist_ok=True)
     todo = [t for t in tiles if not (output_dir / f'{t}.npz').exists()]
     print(f'{args.dataset}: {len(tiles)} tiles selected, {len(tiles) - len(todo)} cached, '
@@ -357,12 +418,14 @@ def main():
         for t in todo:
             print(t)
         return
+    describe_dataset(args.dataset, dataset, args.output / args.dataset)
     log = output_dir / 'log.jsonl'
     failures = []
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         jobs = {pool.submit(process_tile, args.dataset, dataset, t, output_dir, args.spacing,
                             args.supersample, args.archives, args.keep_archives): t for t in todo}
-        for job, tile in jobs.items():
+        for job in as_completed(jobs):  # log each tile when it completes, so an interrupted run loses no record
+            tile = jobs[job]
             try:
                 record = job.result()
                 with log.open('a') as stream:

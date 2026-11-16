@@ -74,6 +74,12 @@ def elements(state):
                 nu=math.degrees(nu), u=math.degrees((argp + nu) % (2 * math.pi)))
 
 
+def terrain_label():
+    """Terrain folder the described renders used (check_stacking_geometry.TERRAIN), relative to the repo."""
+    path = Path(checks.TERRAIN).resolve()
+    return str(path.relative_to(g.REPO)) if path.is_relative_to(g.REPO) else str(path)
+
+
 def enu_axes(lon, lat):
     lo, la = np.radians(lon), np.radians(lat)
     return (np.array([-np.sin(lo), np.cos(lo), 0]),
@@ -232,6 +238,7 @@ def measure():
         ang.append(math.degrees(math.acos(-(rot.T @ fwd_all[0, k]) @ enu_axes(tlon, tlat)[2])))
     M['geodetic_offnadir_deg'] = ang
     # ---- terrain, z = 0 plane, bbox margins
+    checks.require_terrain()
     shapes = []
     for tile in manifest['selected_tiles']:
         with np.load(checks.TERRAIN / f'{tile}.npz') as d:
@@ -550,7 +557,7 @@ def write(M, C, S, out):
       '(including the sun/shadows of the original aerial survey) interpolated over the 2.5 m triangles and averaged by the '
       '8-sample anti-aliasing. No illumination model, no atmosphere, no spectral content beyond R, G, B.')
     t = M['terrain']
-    w(f'- Terrain: {t["tiles"]} tiles (cameras.json selected_tiles; {t["files"]} .npz in data/swarm_terrain), each a '
+    w(f'- Terrain: {t["tiles"]} tiles (cameras.json selected_tiles; {t["files"]} .npz in {terrain_label()}), each a '
       f'regular 2.5 m grid of the photomesh UPPER surface (highest face per cell, empty cells filled from the nearest '
       f'sampled cell; prepare_swarm_terrain.py:62-85, 117-121), so roofs are kept and facades/overhangs are lost. '
       f'Vertices {t["vertices"]:,}, triangles {t["triangles"]:,} (2 per grid cell, render_swarm.py:174-176; run header '
@@ -683,7 +690,7 @@ def results_and_limitations(M, C, st, V):
         (4, 'common target -> image centre', '< 0.01 px', f'max {max(v["max_px"] for v in C["target_centre"].values()):.1e} px (7 sats)', 'step 9; validation_summary.json target'),
         (4, 'deputy ground across alignment', '>= 1 - 1e-10', f'1 - {1-M["alignment_min"]:.1e}', 'step 9 (cameras.json)'),
         (4, 'selected tiles', '570', str(M['terrain']['tiles']), 'step 9 (cameras.json)'),
-        (5, 'terrain caches', '570 valid .npz', f'{M["terrain"]["files"]} files, {M["terrain"]["tiles"]} selected present', 'step 9 (data/swarm_terrain)'),
+        (5, 'terrain caches', '570 valid .npz', f'{M["terrain"]["files"]} files, {M["terrain"]["tiles"]} selected present', f'step 9 ({terrain_label()})'),
         (5, 'triangle count', 'as loaded by the renderer', f'{M["terrain"]["triangles"]:,} (run header {hdr["triangles"]:,})', 'step 9; render_report.jsonl'),
         (6, 'Blender projection checks (every rendered pose)', 'corner < 0.1 px, GSD step < 0.002, target < 0.01 px',
          M['pipeline_worst'], M['pipeline_line']),

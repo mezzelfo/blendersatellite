@@ -34,21 +34,70 @@ conda activate orbits
 python -m pip install -e './orbits[test,render]'
 ```
 
-Keep the original ZIPs outside Git. The default archive location remains
-`../OBJ/melbourne_obj`; set `MELBOURNE_ARCHIVES=/path/to/melbourne_obj` to use
-another location. Prepared terrain under `data/` and renders under `output/`
-are ignored. For sharing data, prefer a download manifest with source URLs and
-checksums or externally hosted versioned datasets; GitHub Releases or Git LFS
-can distribute a small preview cache without bloating the source-code history.
-The original 570 OBJ ZIP URLs are versioned in
-`melbourne_obj_download_links.txt`. Mesh data is provided by the City of
-Melbourne under CC BY 4.0; see the [publisher's dataset](https://discover.data.vic.gov.au/dataset/city-of-melbourne-3d-textured-mesh-photomesh-2020).
-To download the original archives on a new machine (approximately 106 GB):
+Prepared terrain under `data/` and renders under `output/` are ignored by Git.
+Mesh data is provided by the City of Melbourne under CC BY 4.0; see the
+[publisher's dataset](https://discover.data.vic.gov.au/dataset/city-of-melbourne-3d-textured-mesh-photomesh-2020).
+Renders and terrain derived from it must carry that attribution.
+
+### Terrain data
+
+The original OBJ ZIPs (570 tiles, 113.67 GB = about 106 GiB) are no longer kept on disk.
+`terrain_cache.py` downloads one tile at a time, rasterises the upper surface of
+the textured mesh into a grid in the dataset's own projected CRS, writes a small
+compressed `.npz` and deletes the ZIP. The cache does not depend on any orbit
+simulation and is shared by every run:
+
+```
+data/terrain/<dataset>/
+    dataset.json        copy of the dataset entry of terrain_datasets.json
+    tile_grid.json      tile index (ArcGIS JSON) used to select tiles
+    <spacing>m/<tile>.npz   height, rgb, coverage, x0, y0, spacing, ... per tile
+    <spacing>m/log.jsonl    one line per tile, written as each tile completes
+```
+
+`terrain_to_render.py` then bins the cache to the render spacing (2.5 m, from
+`cameras.json`) and converts it into the local ENU frame of one simulation run.
+These render grids go to `<run>/terrain_render/` and are tied to that run's
+local frame (`cache_frame.json` guards against reuse with another frame).
+`run_orbits_melbourne.sh` runs both steps; by hand, for an existing run:
 
 ```bash
-mkdir -p ../OBJ/melbourne_obj
-wget --continue --input-file melbourne_obj_download_links.txt --directory-prefix ../OBJ/melbourne_obj
+python terrain_cache.py --dataset melbourne_2020 --tiles-from <run>/simulation/cameras.json \
+    --spacing 1 --workers 4 [--archives /path/to/already/downloaded/zips]
+python terrain_to_render.py --cameras <run>/simulation/cameras.json \
+    --cache data/terrain/melbourne_2020/1m --dataset melbourne_2020
 ```
+
+Cached tiles are skipped, so a second run downloads nothing (`--dry-run` on either
+command shows what would be done). Measured for Melbourne in step 18 (570 tiles
+at 1 m): 113.67 GB streamed, about 75 min with 12 workers, peak disk 3.8 GB
+(ZIPs in flight), peak RSS 2.8 GB on the largest tile, final cache 236 MB. The
+cell colour is the mean of 4 x 4 sub-cell texture samples. `--rebuild-log`
+recreates missing `log.jsonl` lines from the `.npz` files present.
+
+Adding a dataset: add an entry to `terrain_datasets.json`.
+
+- `format`: reader in `terrain_cache.READERS`. `obj_zip` expects one ZIP per tile
+  holding one `.obj` (all `v`/`vt` lines before the faces, coordinates in metres
+  of `projected_epsg`, z up) and optionally a `.mtl` whose `map_Kd` textures are
+  in the ZIP.
+- `url`: download URL template with `{tile}`; used when the tile is not in `--archives`.
+- `projected_epsg`: CRS of the mesh and of the cache grid.
+- `geographic_epsg`: geographic CRS of the same datum; `terrain_to_render.py`
+  transforms projected -> geographic -> ECEF (EPSG:4979 -> 4978).
+- `vertical`: how heights are treated (informational; heights are used as ellipsoidal).
+- `index`: tile index for `--bbox` and `--all`: `url` of an ArcGIS JSON query with
+  polygon `geometry.rings`, `id_field` (attribute holding the tile id used in `url`),
+  `local_copy` (path relative to the repository, used instead of the URL if present).
+- `description`, `license`: copied to `dataset.json`.
+
+Renders made with this terrain differ in colour from `eevee_full_1000` (cell mean
+instead of one texel per cell: about 12 DN mean |dRGB| on the chief PNGs, no
+geometric shift, step 18). Frames rendered with the two terrains must not be mixed
+in one experiment. The terrain of `eevee_full_1000` (built by the deprecated
+`prepare_swarm_terrain.py`, formerly `data/swarm_terrain`) is kept in
+`output/orbits_melbourne/eevee_full_1000/terrain_render_legacy/`; pass it with
+`TERRAIN=...` to `scripts/render_job.sh` to extend that experiment.
 
 ### Orbit-driven HyperScape100 preview
 
@@ -58,8 +107,7 @@ Activate the `orbits` conda environment, then run from this directory:
 bash run_orbits_melbourne.sh
 ```
 
-The wrapper requires CUDA: orbit integration and numerical terrain sampling
-default to `cuda:0`, and Cycles uses both detected CUDA GPUs with CPU rendering
+The wrapper requires CUDA: orbit integration defaults to `cuda:0`, and Cycles uses both detected CUDA GPUs with CPU rendering
 disabled. Missing GPU access is an error; it does not silently fall back to CPU.
 The installed PyTorch build is `2.10.0+cu126`, compatible with the TITAN Xp's
 Pascal architecture. To recreate it, install PyTorch before the other dependencies:
@@ -68,19 +116,19 @@ Pascal architecture. To recreate it, install PyTorch before the other dependenci
 python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu126
 ```
 
-`ORBITS_DEVICE` and `TERRAIN_DEVICE` select the numerical CUDA device;
+`ORBITS_DEVICE` selects the numerical CUDA device;
 `--gpu-devices 0` selects one Cycles GPU instead of both. Orbit metadata and
-`render_report.json` record the actual selected devices. New terrain caches
-also record their numerical device; existing caches are reused irrespective
-of where they were computed. ZIP/OBJ parsing, JPEG decoding, map projection,
-scene construction and file output remain CPU/I/O operations. Terrain's face
-centroids, cell assignment, sorting and local-frame matrix transforms run on
-CUDA. Four spawned terrain workers are used by default; lower
-`TERRAIN_WORKERS` if GPU memory is constrained. GPU denoising is disabled for
-these small previews so it does not introduce an unsupported CPU denoising pass.
+`render_report.json` record the actual selected devices. Terrain preparation
+runs on the CPU: `TERRAIN_WORKERS` (default 4) sets the number of
+`terrain_cache.py` processes and `TERRAIN_SPACING` (default `1`, written as in
+the folder name, e.g. `1` or `2.5`) the cache spacing in metres;
+`MELBOURNE_ARCHIVES=/path/to/zips` reuses already downloaded ZIPs. GPU denoising
+is disabled for these small previews so it does not introduce an unsupported
+CPU denoising pass.
 
-This runs `orbits/scripts/melbourne_overpass.py`, prepares the selected
-downloaded ZIP tiles, then starts headless Blender with `render_swarm.py`.
+This runs `orbits/scripts/melbourne_overpass.py`, fills the terrain cache with
+the selected tiles and converts them into `<run>/terrain_render` (see Terrain
+data), then starts headless Blender with `render_swarm.py`.
 The default formation is a five-satellite train with the chief in the middle:
 `deputy 1 → deputy 2 → chief → deputy 3 → deputy 4`. Every adjacent pair is
 1 km apart in 3D at the capture epoch. Positions and velocities are rotated
@@ -107,8 +155,8 @@ Existing runs are never overwritten. Each directory contains:
   and the render report.
 - `pipeline.log`: run settings, selected GPU devices, validation and render log.
 
-Terrain caches and the downloaded tile grid under `data/` remain shared across
-runs. The older flat output directory and simulation outputs are preserved.
+The terrain cache and the downloaded tile grid under `data/` remain shared across
+runs; each run also gets `terrain_render/` with its render grids. The older flat output directory and simulation outputs are preserved.
 Standalone exporter runs without `--output` also create unique timestamped
 folders. Explicit exporter/renderer paths refuse to overwrite prior artifacts.
 Satellite 0 is the chief. The
@@ -150,15 +198,16 @@ are converted from EPSG:7855 into a shared local ENU frame in double precision.
 For this preview, AHD heights approximate ellipsoidal heights; precision Earth
 orientation, datum/geoid corrections, and attitude dynamics remain future work.
 
-To bound memory and disk use, `prepare_swarm_terrain.py` reads ZIPs directly
-and samples their face-centroid heights and JPG colors into 2.5 m grids.
-The highest sampled face wins in each cell. Unsampled cells use the nearest
-sample; nonfinite source UVs receive neutral gray. This upper-surface mesh
-simplifies façades/overhangs. Its emission material preserves illumination
+To bound memory and disk use, `terrain_cache.py` streams each ZIP and keeps
+only the upper surface of the mesh (highest face per sub-cell, mean colour per
+cell); `terrain_to_render.py` bins it to 2.5 m render grids. Unsampled cells use
+the nearest sample; nonfinite source UVs receive neutral gray. This upper-surface
+mesh simplifies façades/overhangs. Its emission material preserves illumination
 already baked into the aerial textures. Images do not simulate a new Sun
 position; transparent pixels identify missing geometry at tile boundaries or
-outside the published dataset. Terrain caches total tens of MB rather than
-extracting all selected full-resolution OBJs.
+outside the published dataset. The deprecated `prepare_swarm_terrain.py` (one
+texel per 2.5 m cell, read from already downloaded ZIPs) is kept only to
+reproduce `eevee_full_1000` and for `test_swarm_terrain.py`.
 
 `TERRAIN_WORKERS=1 bash run_orbits_melbourne.sh --samples 4` reduces resource
 use; `BLENDER_BIN=/path/to/blender` selects another build. Subsequent runs

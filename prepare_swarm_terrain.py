@@ -2,12 +2,18 @@
 
 Each cell retains the highest sampled face centroid and its JPG texture color.
 This is an upper-surface preview mesh, not a full-facade photomesh export.
+
+DEPRECATED: superseded by terrain_cache.py + terrain_to_render.py (the default of
+run_orbits_melbourne.sh since step 19). Kept to reproduce eevee_full_1000, whose terrain
+(output/orbits_melbourne/eevee_full_1000/terrain_render_legacy) it built, and for
+test_swarm_terrain.py.
 """
 import argparse
 from array import array
 import io
 import json
 from pathlib import Path
+import sys
 import time
 import zipfile
 from concurrent.futures import ProcessPoolExecutor
@@ -144,6 +150,8 @@ def prepare_tile(archive_path, output, manifest, spacing, device='cpu'):
 
 
 def main():
+    print('WARNING: prepare_swarm_terrain.py is deprecated, superseded by terrain_cache.py + terrain_to_render.py; '
+          'kept to reproduce eevee_full_1000.', file=sys.stderr, flush=True)
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cameras',type=Path,required=True)
     parser.add_argument('--archives',type=Path,required=True)

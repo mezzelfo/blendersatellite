@@ -3,8 +3,9 @@ set -euo pipefail
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(dirname -- "$PROJECT_DIR")"
 ORBITS_DIR="$PROJECT_DIR/orbits"
+# Optional folder of already downloaded ZIPs; tiles missing there are downloaded by terrain_cache.py.
 MELBOURNE_ARCHIVE_DIR="${MELBOURNE_ARCHIVES:-$WORKSPACE_DIR/OBJ/melbourne_obj}"
-TERRAIN_DIR="$PROJECT_DIR/data/swarm_terrain"
+TERRAIN_SPACING="${TERRAIN_SPACING:-1}"
 MELBOURNE_BLENDER_BIN="${BLENDER_BIN:-/snap/blender/current/blender}"
 RUNS_ROOT="${RUNS_ROOT:-$PROJECT_DIR/output/orbits_melbourne}"
 FORMATION="${FORMATION:-train}"
@@ -29,10 +30,10 @@ exec > >(tee "$RUN_DIR/pipeline.log") 2>&1
 echo "Run folder: $RUN_DIR"
 echo "Formation: $FORMATION; adjacent train spacing: $TRAIN_SPACING_M m"
 trap 'echo "Run exited with status $?; artifacts: $RUN_DIR"' EXIT
-if [[ ! -d "$MELBOURNE_ARCHIVE_DIR" ]]; then
-    echo "Melbourne archive directory not found: $MELBOURNE_ARCHIVE_DIR" >&2
-    echo 'Set MELBOURNE_ARCHIVES to the directory containing the downloaded ZIPs.' >&2
-    exit 1
+ARCHIVE_OPTS=()
+if [[ -n "${MELBOURNE_ARCHIVES:-}" && -d "$MELBOURNE_ARCHIVE_DIR" ]]; then
+    ARCHIVE_OPTS=(--archives "$MELBOURNE_ARCHIVE_DIR")
+    echo "Reusing downloaded ZIPs from $MELBOURNE_ARCHIVE_DIR"
 fi
 # Always import the pinned submodule, even if an old editable installation points
 # at a different checkout of orbits in the conda environment.
@@ -52,12 +53,16 @@ conda run --no-capture-output -n orbits python scripts/melbourne_overpass.py \
     --grid "$ORBITS_RUN_DIR/tile_grid.json" --output "$ORBITS_RUN_DIR" --device "${ORBITS_DEVICE:-cuda:0}" \
     --pointing "${POINTING_MODE:-chief-target}" --formation "$FORMATION" \
     --train-spacing-m "$TRAIN_SPACING_M"
-conda run --no-capture-output -n orbits python "$PROJECT_DIR/prepare_swarm_terrain.py" \
+# Terrain: native-CRS cache shared by every run (downloads only the missing tiles), then the
+# render grids in this run's local frame (<run>/terrain_render).
+conda run --no-capture-output -n orbits python "$PROJECT_DIR/terrain_cache.py" \
+    --dataset melbourne_2020 --tiles-from "$ORBITS_RUN_DIR/cameras.json" \
+    --spacing "$TERRAIN_SPACING" --workers "${TERRAIN_WORKERS:-4}" ${ARCHIVE_OPTS[@]+"${ARCHIVE_OPTS[@]}"}
+conda run --no-capture-output -n orbits python "$PROJECT_DIR/terrain_to_render.py" \
     --cameras "$ORBITS_RUN_DIR/cameras.json" \
-    --archives "$MELBOURNE_ARCHIVE_DIR" --output "$TERRAIN_DIR" --workers "${TERRAIN_WORKERS:-4}" \
-    --device "${TERRAIN_DEVICE:-cuda:0}"
+    --cache "$PROJECT_DIR/data/terrain/melbourne_2020/${TERRAIN_SPACING}m" --dataset melbourne_2020
 "$MELBOURNE_BLENDER_BIN" --background --factory-startup --python-exit-code 1 \
     --python "$PROJECT_DIR/render_swarm.py" -- \
-    --cameras "$ORBITS_RUN_DIR/cameras.json" --terrain "$TERRAIN_DIR" \
+    --cameras "$ORBITS_RUN_DIR/cameras.json" --terrain "$RUN_DIR/terrain_render" \
     --output "$RENDER_DIR" "$@"
 echo "Completed run: $RUN_DIR"

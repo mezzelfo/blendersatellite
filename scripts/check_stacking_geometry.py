@@ -14,7 +14,9 @@ Checks
   6. alpha semantics (straight vs premultiplied) and EEVEE-vs-Cycles brightness on the
      Cycles frames kept in the simulation run folder
 Run in the conda environment "orbits":
-    python scripts/check_stacking_geometry.py [--json out.json]
+    python scripts/check_stacking_geometry.py [--json out.json] [--terrain DIR]
+The terrain must be the one the checked PNGs were rendered with: for eevee_full_1000 that is
+the legacy terrain kept next to the renders (default, see TERRAIN).
 """
 import argparse
 import json
@@ -26,7 +28,9 @@ from PIL import Image
 
 import stacking_geometry as g
 
-TERRAIN = g.REPO / 'data/swarm_terrain'
+# Render terrain of eevee_full_1000 (prepare_swarm_terrain.py, formerly data/swarm_terrain);
+# --terrain (or setting this attribute) selects another one.
+TERRAIN = g.REPO / 'output/orbits_melbourne/eevee_full_1000/terrain_render_legacy'
 CYCLES_RUN = g.REPO / 'output/orbits_melbourne/20261109T180310Z_run_v2/renders'
 FRAMES = (0, 499, 999)
 H, W = g.HEIGHT, g.WIDTH
@@ -37,7 +41,16 @@ def png(sat, frame, run=None):
     return np.asarray(Image.open(path).convert('RGBA'))
 
 
+def require_terrain():
+    """Fail with a clear message when the terrain folder is missing."""
+    if not Path(TERRAIN).is_dir():
+        raise SystemExit(f'Terrain folder not found: {TERRAIN}. The eevee_full_1000 checks need the legacy '
+                         'terrain (output/orbits_melbourne/eevee_full_1000/terrain_render_legacy); '
+                         'pass --terrain DIR for another one.')
+
+
 def load_terrain(selected):
+    require_terrain()
     verts, rgb = [], []
     for tile in selected:
         with np.load(TERRAIN / f'{tile}.npz') as d:
@@ -191,9 +204,14 @@ def run_checks(seed=0, n_vertices=200000):
 
 
 def main():
+    global TERRAIN
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--json', type=Path, help='also write the results here')
+    parser.add_argument('--terrain', type=Path, help=f'render terrain folder (default {TERRAIN})')
     args = parser.parse_args()
+    if args.terrain is not None:
+        TERRAIN = args.terrain
+    print('terrain:', TERRAIN)
     res = run_checks()
     print('round trip max px:', res['round_trip_max_px'])
     print('target -> centre max px:', {s: v['max_px'] for s, v in res['target_centre'].items()})
