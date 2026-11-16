@@ -13,7 +13,17 @@ set -euo pipefail
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BLENDER_BIN="${BLENDER_BIN:-/snap/blender/current/blender}"
 CAMERAS="${CAMERAS:-$PROJECT_DIR/output/orbits_melbourne/20261109T180310Z_run_v2/simulation/cameras.json}"
-TERRAIN="${TERRAIN:-$PROJECT_DIR/data/swarm_terrain}"
+# Default terrain: the render grids of the run that owns CAMERAS (<run>/simulation/cameras.json
+# -> <run>/terrain_render, written by terrain_to_render.py). eevee_full_1000 used the legacy
+# terrain: TERRAIN=$PROJECT_DIR/output/orbits_melbourne/eevee_full_1000/terrain_render_legacy.
+if [[ -z "${TERRAIN:-}" ]]; then
+    TERRAIN="$(dirname -- "$(dirname -- "$CAMERAS")")/terrain_render"
+    if [[ ! -d "$TERRAIN" ]]; then
+        echo "Terrain folder not found: $TERRAIN" >&2
+        echo 'Run terrain_to_render.py for this cameras.json or set TERRAIN to a render terrain folder.' >&2
+        exit 1
+    fi
+fi
 BENCH="${1:-$PROJECT_DIR/output/orbits_melbourne/$(date -u +%Y%m%dT%H%M%SZ)_bench_step7}"
 shift || true
 CONFIGS=("${@:-a_one_process b_two_same_gpu c_one_per_gpu}")

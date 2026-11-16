@@ -5,12 +5,23 @@
 # Usage: scripts/render_job.sh NVSMI_GPU "SATELLITES" [--check-only]
 #   NVSMI_GPU   physical GPU as numbered by nvidia-smi (0 or 1)
 #   SATELLITES  space-separated satellite ids, e.g. "0 1 2 3"
-# Environment: OUTPUT (renders folder), CAMERAS, TERRAIN, BLENDER_BIN, FRAMES (default 0:1000).
+# Environment: OUTPUT (renders folder), CAMERAS, TERRAIN (default <run of CAMERAS>/terrain_render),
+#   BLENDER_BIN, FRAMES (default 0:1000).
 set -euo pipefail
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BLENDER_BIN="${BLENDER_BIN:-/snap/blender/current/blender}"
 CAMERAS="${CAMERAS:-$PROJECT_DIR/output/orbits_melbourne/20261109T180310Z_run_v2/simulation/cameras.json}"
-TERRAIN="${TERRAIN:-$PROJECT_DIR/data/swarm_terrain}"
+# Default terrain: the render grids of the run that owns CAMERAS (<run>/simulation/cameras.json
+# -> <run>/terrain_render, written by terrain_to_render.py). eevee_full_1000 used the legacy
+# terrain: TERRAIN=$PROJECT_DIR/output/orbits_melbourne/eevee_full_1000/terrain_render_legacy.
+if [[ -z "${TERRAIN:-}" ]]; then
+    TERRAIN="$(dirname -- "$(dirname -- "$CAMERAS")")/terrain_render"
+    if [[ ! -d "$TERRAIN" ]]; then
+        echo "Terrain folder not found: $TERRAIN" >&2
+        echo 'Run terrain_to_render.py for this cameras.json or set TERRAIN to a render terrain folder.' >&2
+        exit 1
+    fi
+fi
 OUTPUT="${OUTPUT:-$PROJECT_DIR/output/orbits_melbourne/eevee_full_1000/renders}"
 FRAMES="${FRAMES:-0:1000}"
 NVSMI_GPU="$1"; SATELLITES="$2"; MODE="${3:-}"
