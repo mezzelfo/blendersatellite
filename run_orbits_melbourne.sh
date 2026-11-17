@@ -10,6 +10,13 @@ MELBOURNE_BLENDER_BIN="${BLENDER_BIN:-/snap/blender/current/blender}"
 RUNS_ROOT="${RUNS_ROOT:-$PROJECT_DIR/output/orbits_melbourne}"
 FORMATION="${FORMATION:-train}"
 TRAIN_SPACING_M="${TRAIN_SPACING_M:-1000}"
+# Optional acquisition file (orbits/data/acquisitions/*.json, e.g. hex7_async_10deg.json):
+# formation file, sync/async mode, roles, incidence, line rule, frame period, n_frames.
+ACQUISITION="${ACQUISITION:-}"
+ACQUISITION_OPTS=()
+if [[ -n "$ACQUISITION" ]]; then
+    ACQUISITION_OPTS=(--acquisition "$ACQUISITION")
+fi
 for argument in "$@"; do
     if [[ "$argument" == --output || "$argument" == --output=* ]]; then
         echo 'Use RUNS_ROOT to select the output root; every invocation creates a new run folder.' >&2
@@ -28,7 +35,7 @@ RENDER_DIR="$RUN_DIR/renders"
 mkdir -p "$ORBITS_RUN_DIR" "$RENDER_DIR" "$PROJECT_DIR/data"
 exec > >(tee "$RUN_DIR/pipeline.log") 2>&1
 echo "Run folder: $RUN_DIR"
-echo "Formation: $FORMATION; adjacent train spacing: $TRAIN_SPACING_M m"
+echo "Formation: $FORMATION; adjacent train spacing: $TRAIN_SPACING_M m; acquisition: ${ACQUISITION:-none}"
 trap 'echo "Run exited with status $?; artifacts: $RUN_DIR"' EXIT
 ARCHIVE_OPTS=()
 if [[ -n "${MELBOURNE_ARCHIVES:-}" && -d "$MELBOURNE_ARCHIVE_DIR" ]]; then
@@ -52,7 +59,7 @@ cp "$TILE_GRID" "$ORBITS_RUN_DIR/tile_grid.json"
 conda run --no-capture-output -n orbits python scripts/melbourne_overpass.py \
     --grid "$ORBITS_RUN_DIR/tile_grid.json" --output "$ORBITS_RUN_DIR" --device "${ORBITS_DEVICE:-cuda:0}" \
     --pointing "${POINTING_MODE:-chief-target}" --formation "$FORMATION" \
-    --train-spacing-m "$TRAIN_SPACING_M"
+    --train-spacing-m "$TRAIN_SPACING_M" ${ACQUISITION_OPTS[@]+"${ACQUISITION_OPTS[@]}"}
 # Terrain: native-CRS cache shared by every run (downloads only the missing tiles), then the
 # render grids in this run's local frame (<run>/terrain_render).
 # Cache folder name formatted exactly as terrain_cache.py does (1, 1.0 and 1.00 -> 1m).
@@ -64,8 +71,17 @@ conda run --no-capture-output -n orbits python "$PROJECT_DIR/terrain_cache.py" \
 conda run --no-capture-output -n orbits python "$PROJECT_DIR/terrain_to_render.py" \
     --cameras "$ORBITS_RUN_DIR/cameras.json" \
     --cache "$TERRAIN_CACHE_DIR" --dataset melbourne_2020
-"$MELBOURNE_BLENDER_BIN" --background --factory-startup --python-exit-code 1 \
-    --python "$PROJECT_DIR/render_swarm.py" -- \
-    --cameras "$ORBITS_RUN_DIR/cameras.json" --terrain "$RUN_DIR/terrain_render" \
-    --output "$RENDER_DIR" "$@"
+if [[ "${RENDER_MODE:-frames}" == raw ]]; then
+    # Keep only the band rows (raw/) and one reference frame every 100; see scripts/render_to_raw.py.
+    conda run --no-capture-output -n orbits python "$PROJECT_DIR/scripts/render_to_raw.py" \
+        --cameras "$ORBITS_RUN_DIR/cameras.json" --terrain "$RUN_DIR/terrain_render" \
+        --output "$RENDER_DIR" --blender "$MELBOURNE_BLENDER_BIN" \
+        --n-bands "${RAW_BANDS:-32}" --tdi-rows "${RAW_TDI_ROWS:-8}" --block "${RAW_BLOCK:-100}" \
+        --ref-every "${RAW_REF_EVERY:-100}" ${RAW_KEEP_FRAMES:+--keep-frames} -- "$@"
+else
+    "$MELBOURNE_BLENDER_BIN" --background --factory-startup --python-exit-code 1 \
+        --python "$PROJECT_DIR/render_swarm.py" -- \
+        --cameras "$ORBITS_RUN_DIR/cameras.json" --terrain "$RUN_DIR/terrain_render" \
+        --output "$RENDER_DIR" "$@"
+fi
 echo "Completed run: $RUN_DIR"

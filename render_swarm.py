@@ -233,8 +233,13 @@ def main():
                 manifest['origin_ecef_m'],manifest['local_from_ecef'])
             recomputed,target,across=camera_geometry.retarget_cameras(records,'chief-target',target_local)
             target_delta=float(np.linalg.norm(np.subtract(target,epoch['common_target_local_m'])))
-            basis_delta=float(max(np.max(np.abs(np.subtract(a['camera_to_local'],b['camera_to_local'])))
-                                  for a,b in zip(recomputed,records)))
+            # Deputies with their own aim (acquisition files, orbits.acquisition): check the stored
+            # pose against aimed_basis(position, target_local_m, aim_across_local) and keep it.
+            aimed={i for i,r in enumerate(records) if 'aim_across_local' in r}
+            recomputed=[records[i] if i in aimed else r for i,r in enumerate(recomputed)]
+            basis_delta=float(max(camera_geometry.aimed_record_error(b) if i in aimed else
+                                  np.max(np.abs(np.subtract(a['camera_to_local'],b['camera_to_local'])))
+                                  for i,(a,b) in enumerate(zip(recomputed,records))))
             if target_delta>1e-3 or basis_delta>1e-9:
                 raise RuntimeError(f'Frame {frame}: recomputed target differs by {target_delta} m, basis by {basis_delta}')
             worst['target_recompute_m']=max(worst['target_recompute_m'],target_delta)
@@ -278,10 +283,15 @@ def main():
             worst['pixel_step_dev']=max(worst['pixel_step_dev'],abs(pixel_step-1))
             target_error=None;alignment=None
             if chief_target:
-                target_pixel=world_to_camera_view(scene,camera,Vector(target))
+                # Aimed deputies (acquisition files) look at their own target and orient the detector
+                # line by their own rule: their pose was checked above against aimed_basis, so here the
+                # alignment with the chief's across-track is only reported.
+                aimed_record='aim_across_local' in record
+                own_target=record['target_local_m'] if aimed_record else target
+                target_pixel=world_to_camera_view(scene,camera,Vector(own_target))
                 target_error=float(np.hypot((target_pixel.x-.5)*width,(target_pixel.y-.5)*height))
                 alignment=float(np.dot(projected_across,across))
-                if target_error>.01 or alignment<1-1e-10:
+                if target_error>.01 or (alignment<1-1e-10 and not aimed_record):
                     raise RuntimeError(f'Frame {frame} camera {index}: target error {target_error}px, across-track alignment {alignment}')
                 worst['target_px']=max(worst['target_px'],target_error)
                 worst['alignment']=min(worst['alignment'],alignment)
@@ -292,7 +302,7 @@ def main():
                 path.parent.mkdir(exist_ok=True)
                 set_crop(scene.render,crop,width,height)
                 out_w,out_h=(width,height) if crop is None else (crop['width'],crop['height'])
-                pose=dict(record,frame=frame,t_s=epoch['t_s'],image=path.name,
+                pose=dict(record,frame=frame,t_s=record.get('t_s',epoch['t_s']),image=path.name,
                           common_target_local_m=target,chief_ground_across_local=across)
                 if crop is not None:pose['crop']=crop  # pixel (0,0) of the PNG is sensor pixel (x0,y0)
                 key=(frame,json.dumps(crop))

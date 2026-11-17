@@ -37,7 +37,12 @@ between the four central pixels. To read the PNG value at a continuous (r, c), u
 pixel np.rint(r), np.rint(c) (nearest neighbour) or bilinear interpolation on integer
 centres. Image-up (decreasing row) points along the chief's ECEF-relative velocity;
 ground features therefore move towards INCREASING PNG row as the frame index grows
-(+1 row per frame for the chief, frame_period_mode ground).
+(+1 row per frame for the chief, frame_period_mode ground; about 1.008 rows per frame with
+the fixed nominal period and about 0.98 for the fore/aft satellites of an async acquisition).
+
+Frame times: every record carries its own t_s (async acquisitions: the fore/aft
+satellites image the scene in their own window, about 11 s before/after the chief); runs
+exported before the acquisition files have only the epoch t_s, used as fallback.
 
 Inverse (pixel -> ray):
     u = (c + 1/2) / W,  v = 1 - (r + 1/2) / H
@@ -136,7 +141,7 @@ def load_poses(satellite):
         records = {}
         for epoch in manifest['epochs']:
             rec = next(c for c in epoch['cameras'] if c['satellite_id'] == satellite)
-            records[epoch['frame']] = dict(rec, t_s=epoch['t_s'])
+            records[epoch['frame']] = dict(rec, t_s=rec.get('t_s', epoch['t_s']))
         out = _stack(records, n_frames); out['source'] = 'cameras.json'
     if out['resolution'] != (WIDTH, HEIGHT) or out['focal_length_mm'] != FOCAL_MM \
             or out['sensor_width_mm'] != SENSOR_WIDTH_MM:

@@ -143,6 +143,37 @@ distances and adjacent extrema over the sampled minute are saved in each run's
 Use `TRAIN_SPACING_M=100000 bash run_orbits_melbourne.sh` for a 100 km train, or
 `FORMATION=random bash run_orbits_melbourne.sh` for the former compact random
 swarm. The standalone exporter accepts `--formation` and `--train-spacing-m`.
+
+`ACQUISITION=hex7_sync.json bash run_orbits_melbourne.sh` and
+`ACQUISITION=hex7_async_10deg.json bash run_orbits_melbourne.sh` fly the ROE hexagon
+of `orbits/data/formations/roe_hex7_dmax1km.json` with an acquisition file of
+`orbits/data/acquisitions/` (exporter option `--acquisition`). The file sets the
+formation file, the mode, the roles, the incidence, the detector-line rule, the
+frame period and the number of frames. `sync`: every deputy on the chief's nadir
+target, one window. `async`: the chief at its nadir, deputies 2 and 5 on the chief's
+nadir target, 1 and 4 forward and 3 and 6 backward along the chief's ground trace
+with 10 deg incidence at the target (GroundTrackLead), one window per role centred on
+the time the role sees Melbourne (about -11.7 s and +11.3 s). The pointing math is the
+one of swarm_simulator (`camera_geometry.aimed_basis` = `camera_rotation`), see the
+docstring of `orbits/src/orbits/acquisition.py`. Each camera record carries its own
+`t_s`, `acquisition_role`, `target_local_m` and `aim_across_local`; the epoch `t_s` is
+the time of the chief. `orbits/scripts/validate_acquisition.py` checks an exported run.
+
+`RENDER_MODE=raw` keeps only the raw pushbroom data instead of the full frames
+(`scripts/render_to_raw.py`): frames 0 and 999 fix the detector rows that see the
+scene over the whole window for every satellite, 32 bands of 8 adjacent rows (start
+rows multiples of 4) are spread over them, and the run is rendered in blocks of 100
+frames. After each block the rows are written to `raw/sat_SS.npy` (uint8
+[256, 1000, 4096, 4], raw[i, k, c] = PNG pixel (rows[i], c) of frame k), read back,
+compared with the PNGs, and the PNGs are deleted except one reference frame every
+100 (and the last), moved to `reference_frames/`. About 4.2 GB per satellite instead
+of 8.2 GB of PNGs; launching the same command again resumes from `raw/progress.json`.
+Example: `ACQUISITION=hex7_async_10deg.json RENDER_MODE=raw bash run_orbits_melbourne.sh --engine EEVEE`.
+Do not pass `--frames` or `--satellites` in this mode.
+`RAW_KEEP_FRAMES=1` extracts the raw rows but keeps every PNG (no deletion).
+`scripts/build_cubes.py --run RUN --layout raw_bands --mode none|linear|bilinear --source raw|png`
+builds the cubes on the ground from either source (identical results); `bilinear` follows the
+column drift of oblique (fore/aft) views, `linear` keeps the column fixed, `none` steps whole frames.
 Every invocation creates a fresh directory such as
 `output/orbits_melbourne/20261028T171037Z_run_8bJvD7/`; the UTC timestamp plus
 unique suffix prevents collisions even for simultaneous runs. `RUNS_ROOT`

@@ -184,3 +184,33 @@ def test_band_rows_validation():
             cs.band_rows(bad)
     with pytest.raises(KeyError):
         cs.band_rows('nope')
+
+
+def test_raw_reader_matches_frames():
+    rng = np.random.default_rng(3)
+    raw_rows = np.array([10, 11, 20, 21, 30, 31])
+    raw = rng.integers(0, 256, (6, 5, 40, 4), dtype=np.uint8)          # [R, F, W, 4]
+    read = cs.raw_reader(raw, raw_rows, [11, 30], np.arange(5, 25))
+    for k in range(5):
+        np.testing.assert_array_equal(read(k), raw[[1, 4], k, 5:25])
+    with pytest.raises(ValueError):
+        cs.raw_reader(raw, raw_rows, [12], np.arange(5, 25))
+
+
+def test_bilinear_integer_index_is_exact_and_midpoint_is_mean():
+    rng = np.random.default_rng(4)
+    F, B, W = 6, 2, 12
+    frames = rng.integers(0, 256, (F, B, W, 4), dtype=np.uint8)
+    cols = np.arange(W)
+    g = np.arange(3)
+    k = np.broadcast_to(np.array([1., 4.])[None, None, :], (3, W, B)).copy()
+    c = np.broadcast_to(cols[None, :, None].astype(float), (3, W, B)).copy()
+    cube, _ = cs.build_cube(lambda kk: frames[kk], [5, 9], cols, g, 'bilinear', np.stack([k, c]), n_frames=F)
+    np.testing.assert_array_equal(cube[0, :, 0], frames[1, 0]); np.testing.assert_array_equal(cube[2, :, 1], frames[4, 1])
+    k2, c2 = k + 0.5, c + 0.5
+    c2[:, -1] = np.nan                                                  # outside: transparent
+    cube, _ = cs.build_cube(lambda kk: frames[kk], [5, 9], cols, g, 'bilinear', np.stack([k2, c2]), n_frames=F)
+    f = frames.astype(float)
+    expect = np.rint((f[1, 0, :-1] + f[1, 0, 1:] + f[2, 0, :-1] + f[2, 0, 1:]) / 4)
+    assert np.max(np.abs(cube[1, :-1, 0].astype(float) - expect)) <= 0.5 + 1e-9
+    assert np.all(cube[:, -1] == 0)
