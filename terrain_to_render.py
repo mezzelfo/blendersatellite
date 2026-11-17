@@ -15,10 +15,10 @@ with --terrain <output> and no change to the renderer.
       --cache data/terrain/melbourne_2020/1m --dataset melbourne_2020
   (output by default in <run>/terrain_render)
 
---walls (cache built with terrain_cache.py --facades) adds vertical walls: on the render grid,
-every shared edge between 4-adjacent cells whose heights differ by more than --wall-threshold
-(2 m) gets a wall from the lower to the upper height, split into segments of height <= the
-render spacing and coloured from the facade voxels (see build_walls and colour_segments). The
+--walls (needs the facade voxels, which terrain_cache.py stores unless --no-facades) adds
+vertical walls: on the render grid, every shared edge between 4-adjacent cells whose heights
+differ by more than --wall-threshold (2 m) gets a wall from the lower to the upper height,
+split into segments of height <= the render spacing and coloured from the facade voxels (see build_walls and colour_segments). The
 neighbouring tiles' grids and voxels are loaded as a one-cell halo, and a seam edge belongs to
 the tile holding its west or south cell. Extra keys in the render .npz (grid keys unchanged):
   wall_vertices  float32 (4 S, 3), local frame, 4 corners per segment
@@ -407,7 +407,7 @@ def facade_loader(cache_dir, maxsize=32):
     def load(tile):
         with np.load(Path(cache_dir) / f'{tile}.npz') as data:
             if 'facade_ijk' not in data.files:
-                raise ValueError(f'{cache_dir}/{tile}.npz has no facade voxels (terrain_cache.py --facades)')
+                raise ValueError(f'{cache_dir}/{tile}.npz has no facade voxels (built with terrain_cache.py --no-facades)')
             return dict(ijk=data['facade_ijk'].astype(np.int64), rgb=data['facade_rgb'], normal=data['facade_normal'],
                         count=data['facade_count'], voxel=float(data['facade_voxel']))
     return load
@@ -456,7 +456,7 @@ def main():
                         help='default: <run>/terrain_render, where cameras.json is <run>/simulation/cameras.json')
     parser.add_argument('--spacing', type=float, help="render grid spacing; default: cameras.json mesh_grid_spacing_m")
     parser.add_argument('--walls', action='store_true',
-                        help='add vertical walls coloured from the facade voxels (cache built with --facades)')
+                        help='add vertical walls coloured from the facade voxels (cache not built with --no-facades)')
     parser.add_argument('--wall-threshold', type=float, default=2.0,
                         help='height difference (m) between adjacent render cells above which a wall is built')
     parser.add_argument('--force', action='store_true')

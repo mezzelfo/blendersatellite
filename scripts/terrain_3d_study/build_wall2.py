@@ -1,10 +1,12 @@
 """Variants WALL2 and WALL2_BLOCK of the step-22 validation: pipeline walls from facade voxels.
 
   python -I build_wall2.py --study STUDY --block CBD --cache STUDY/wall2/data/melbourne_2020/1m_facades
+  (the step-22 study cache, built with the then-option --facades --tag facades; any cache with facade
+  voxels works, e.g. data/terrain/melbourne_2020/1m)
   python -I build_wall2.py ... --all-steps          (variant WALL2_BLOCK)
 
 The walls are made by the pipeline code itself (terrain_to_render.render_grid and build_walls,
-imported, unchanged) from the block's facade caches (terrain_cache.py --facades), at the render
+imported, unchanged) from the block's facade caches (terrain_cache.py, facade voxels by default), at the render
 spacing 2.5 m and the default threshold 2 m, in EPSG:7855. Only the block's 9 tiles are loaded,
 so the block's outer border has no halo, like the border of a run's tile selection.
 

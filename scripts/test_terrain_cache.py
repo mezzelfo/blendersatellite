@@ -6,8 +6,9 @@ and B = 50, all files inside a subfolder of the archive:
   SMALL: ground of 3 m triangles on the slope z = 0.01 x, plus a 20 x 20 m building
          (x, y in 100..120) with a flat roof at 30 m and four vertical walls;
   BIG:   the ground as only two triangles (flat, z = 0), plus the same building.
-Both are cached at 1 m and 2.5 m with --archives, then converted to a render frame
-centred on the tile; the two caches must give the same render grid.
+Both are cached at 1 m and 2.5 m with --archives (default: with facade voxels), then converted
+to a render frame centred on the tile; the two caches must give the same render grid.
+The step-22 tests below (facades and walls) add tiles WALLS, SEAM_W and SEAM_E.
 
   conda run -n orbits python -m pytest -q scripts/test_terrain_cache.py
 """
@@ -300,23 +301,25 @@ def walls_built(tmp_path_factory):
     make_zip(archives / 'SMALL.zip', small=True)
     tiles = ['WALLS', 'SEAM_W', 'SEAM_E']
     cache = tmp / 'cache'
-    run(ROOT / 'terrain_cache.py', '--dataset', 'melbourne_2020', '--tiles', *tiles, 'SMALL',
-        '--archives', archives, '--output', cache, '--spacing', 1, '--workers', 1, '--facades', '--tag', 'facades')
+    # Default (facades) into 1m/, as the pipeline; grid only (--no-facades) into 1m_grid/.
     run(ROOT / 'terrain_cache.py', '--dataset', 'melbourne_2020', '--tiles', *tiles, 'SMALL',
         '--archives', archives, '--output', cache, '--spacing', 1, '--workers', 1)
+    run(ROOT / 'terrain_cache.py', '--dataset', 'melbourne_2020', '--tiles', *tiles, 'SMALL',
+        '--archives', archives, '--output', cache, '--spacing', 1, '--workers', 1, '--no-facades', '--tag', 'grid')
     cameras = tmp / 'cameras.json'
     enu_cameras(cameras, tiles)
     render = tmp / 'render_walls'
-    run(ROOT / 'terrain_to_render.py', '--cameras', cameras, '--cache', cache / 'melbourne_2020' / '1m_facades',
+    run(ROOT / 'terrain_to_render.py', '--cameras', cameras, '--cache', cache / 'melbourne_2020' / '1m',
         '--dataset', 'melbourne_2020', '--output', render, '--walls')
     plain = tmp / 'render_plain'
-    run(ROOT / 'terrain_to_render.py', '--cameras', cameras, '--cache', cache / 'melbourne_2020' / '1m_facades',
+    run(ROOT / 'terrain_to_render.py', '--cameras', cameras, '--cache', cache / 'melbourne_2020' / '1m',
         '--dataset', 'melbourne_2020', '--output', plain)
-    return dict(cache=cache / 'melbourne_2020', render=render, plain=plain, cameras=cameras, tiles=tiles)
+    return dict(cache=cache / 'melbourne_2020', render=render, plain=plain, cameras=cameras, tiles=tiles,
+                archives=archives, root=cache)
 
 
 def facade_voxels(built, tile):
-    with np.load(built['cache'] / '1m_facades' / f'{tile}.npz') as data:
+    with np.load(built['cache'] / '1m' / f'{tile}.npz') as data:
         return {k: data[k] for k in data.files}
 
 
@@ -368,8 +371,8 @@ def test_facade_voxel_colours_and_normals(walls_built):
 
 def test_facades_keep_grid_bit_for_bit(walls_built):
     for tile in walls_built['tiles'] + ['SMALL']:
-        with np.load(walls_built['cache'] / '1m_facades' / f'{tile}.npz') as a, \
-                np.load(walls_built['cache'] / '1m' / f'{tile}.npz') as b:
+        with np.load(walls_built['cache'] / '1m' / f'{tile}.npz') as a, \
+                np.load(walls_built['cache'] / '1m_grid' / f'{tile}.npz') as b:
             assert 'facade_ijk' in a.files and 'facade_ijk' not in b.files
             for key in ('height', 'rgb', 'coverage', 'x0', 'y0', 'spacing', 'supersample'):
                 assert np.array_equal(a[key], b[key], equal_nan=True), (tile, key)
@@ -378,7 +381,7 @@ def test_facades_keep_grid_bit_for_bit(walls_built):
 def native_walls(walls_built):
     """build_walls on the native grids of the three tiles (same code as terrain_to_render.py --walls)."""
     from terrain_to_render import build_walls, facade_loader, render_grid
-    cache = walls_built['cache'] / '1m_facades'
+    cache = walls_built['cache'] / '1m'
     grids = {t: render_grid(cache / f'{t}.npz', 2.5) for t in walls_built['tiles']}
     load = facade_loader(cache)
     return {t: build_walls(t, grids, load, 2.5, 2.0) for t in walls_built['tiles']}
@@ -451,9 +454,27 @@ def test_render_npz_walls(walls_built):
 
 def test_walls_refuse_mixing(walls_built, tmp_path):
     # --walls into a folder made without walls, and --walls on a cache without facades.
-    for cache, output in ((walls_built['cache'] / '1m_facades', walls_built['plain']),
-                          (walls_built['cache'] / '1m', tmp_path / 'out')):
+    for cache, output in ((walls_built['cache'] / '1m', walls_built['plain']),
+                          (walls_built['cache'] / '1m_grid', tmp_path / 'out')):
         result = subprocess.run([sys.executable, ROOT / 'terrain_to_render.py', '--cameras', walls_built['cameras'],
                                  '--cache', cache, '--dataset', 'melbourne_2020', '--output', output, '--walls'],
                                 cwd=ROOT, capture_output=True, text=True)
         assert result.returncode != 0
+
+
+def test_cache_refuses_mixed_tiles(walls_built):
+    """terrain_cache.py refuses a folder whose tiles differ from the request, in both directions
+    (facades vs grid only, facade voxel size, supersample), even for tiles not yet cached there."""
+    base = [sys.executable, ROOT / 'terrain_cache.py', '--dataset', 'melbourne_2020', '--tiles', 'BIGNEW',
+            '--archives', walls_built['archives'], '--output', walls_built['root'], '--spacing', 1, '--workers', 1]
+    cases = [['--no-facades'],                                     # grid-only request, facade folder 1m/
+             ['--tag', 'grid'],                                    # facade request, grid-only folder 1m_grid/
+             ['--facade-voxel', '0.5'],                            # other voxel size
+             ['--supersample', '2']]                               # other supersampling
+    for extra in cases:
+        result = subprocess.run(list(map(str, base + extra)), cwd=ROOT, capture_output=True, text=True)
+        assert result.returncode != 0 and 'built differently' in result.stderr, (extra, result.stderr[-500:])
+    # Matching requests still pass (dry run, nothing written).
+    for extra in ([], ['--no-facades', '--tag', 'grid']):
+        result = subprocess.run(list(map(str, base + extra + ['--dry-run'])), cwd=ROOT, capture_output=True, text=True)
+        assert result.returncode == 0, (extra, result.stderr[-500:])

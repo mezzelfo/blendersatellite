@@ -6,6 +6,16 @@ ORBITS_DIR="$PROJECT_DIR/orbits"
 # Optional folder of already downloaded ZIPs; tiles missing there are downloaded by terrain_cache.py.
 MELBOURNE_ARCHIVE_DIR="${MELBOURNE_ARCHIVES:-$WORKSPACE_DIR/OBJ/melbourne_obj}"
 TERRAIN_SPACING="${TERRAIN_SPACING:-1}"
+# Terrain walls (README "Walls from the photomesh facades"): WALLS=1 (default) adds vertical walls
+# coloured from the facade voxels of the cache wherever adjacent render cells differ in height by
+# more than WALL_THRESHOLD metres; WALLS=0 renders the same cache as the 2.5D grid only (GRID).
+WALLS="${WALLS:-1}"
+WALL_THRESHOLD="${WALL_THRESHOLD:-2}"
+case "$WALLS" in
+    1) WALL_OPTS=(--walls --wall-threshold "$WALL_THRESHOLD") ;;
+    0) WALL_OPTS=() ;;
+    *) echo "WALLS must be 0 or 1, not '$WALLS'" >&2; exit 1 ;;
+esac
 MELBOURNE_BLENDER_BIN="${BLENDER_BIN:-/snap/blender/current/blender}"
 RUNS_ROOT="${RUNS_ROOT:-$PROJECT_DIR/output/orbits_melbourne}"
 FORMATION="${FORMATION:-train}"
@@ -36,6 +46,11 @@ mkdir -p "$ORBITS_RUN_DIR" "$RENDER_DIR" "$PROJECT_DIR/data"
 exec > >(tee "$RUN_DIR/pipeline.log") 2>&1
 echo "Run folder: $RUN_DIR"
 echo "Formation: $FORMATION; adjacent train spacing: $TRAIN_SPACING_M m; acquisition: ${ACQUISITION:-none}"
+if [[ "$WALLS" == 1 ]]; then
+    echo "Terrain: cache spacing $TERRAIN_SPACING m, walls ON (WALLS=1, threshold $WALL_THRESHOLD m)"
+else
+    echo "Terrain: cache spacing $TERRAIN_SPACING m, walls OFF (WALLS=0, grid only)"
+fi
 trap 'echo "Run exited with status $?; artifacts: $RUN_DIR"' EXIT
 ARCHIVE_OPTS=()
 if [[ -n "${MELBOURNE_ARCHIVES:-}" && -d "$MELBOURNE_ARCHIVE_DIR" ]]; then
@@ -60,8 +75,9 @@ conda run --no-capture-output -n orbits python scripts/melbourne_overpass.py \
     --grid "$ORBITS_RUN_DIR/tile_grid.json" --output "$ORBITS_RUN_DIR" --device "${ORBITS_DEVICE:-cuda:0}" \
     --pointing "${POINTING_MODE:-chief-target}" --formation "$FORMATION" \
     --train-spacing-m "$TRAIN_SPACING_M" ${ACQUISITION_OPTS[@]+"${ACQUISITION_OPTS[@]}"}
-# Terrain: native-CRS cache shared by every run (downloads only the missing tiles), then the
-# render grids in this run's local frame (<run>/terrain_render).
+# Terrain: native-CRS cache shared by every run (downloads only the missing tiles and builds them
+# with facade voxels), then the render grids in this run's local frame (<run>/terrain_render),
+# with walls unless WALLS=0. Both render modes below read <run>/terrain_render.
 # Cache folder name formatted exactly as terrain_cache.py does (1, 1.0 and 1.00 -> 1m).
 TERRAIN_CACHE_DIR="$PROJECT_DIR/data/terrain/melbourne_2020/$(conda run -n orbits python -c \
     "import sys; print(f'{float(sys.argv[1]):g}m')" "$TERRAIN_SPACING")"
@@ -70,7 +86,7 @@ conda run --no-capture-output -n orbits python "$PROJECT_DIR/terrain_cache.py" \
     --spacing "$TERRAIN_SPACING" --workers "${TERRAIN_WORKERS:-4}" ${ARCHIVE_OPTS[@]+"${ARCHIVE_OPTS[@]}"}
 conda run --no-capture-output -n orbits python "$PROJECT_DIR/terrain_to_render.py" \
     --cameras "$ORBITS_RUN_DIR/cameras.json" \
-    --cache "$TERRAIN_CACHE_DIR" --dataset melbourne_2020
+    --cache "$TERRAIN_CACHE_DIR" --dataset melbourne_2020 ${WALL_OPTS[@]+"${WALL_OPTS[@]}"}
 if [[ "${RENDER_MODE:-frames}" == raw ]]; then
     # Keep only the band rows (raw/) and one reference frame every 100; see scripts/render_to_raw.py.
     conda run --no-capture-output -n orbits python "$PROJECT_DIR/scripts/render_to_raw.py" \

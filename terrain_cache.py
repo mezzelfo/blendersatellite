@@ -23,7 +23,7 @@ Output per tile, arrays indexed [row, col] with row 0 at the SOUTH edge
             so tiles of the same dataset share one global grid)
   spacing, supersample, epsg, dataset, tile, plus timing/size metadata
 
-With --facades the same .npz also holds the near-vertical faces (|n_z| < 0.3) as coloured
+By default the same .npz also holds the near-vertical faces (|n_z| < 0.3) as coloured
 samples on a global 3D voxel grid of size --facade-voxel (default 1 m), aligned to multiples
 of it in the dataset CRS (see FacadeVoxels; terrain_to_render.py --walls turns them into walls,
 since the wall positions depend on the render spacing chosen later). One entry per voxel:
@@ -33,9 +33,11 @@ since the wall positions depend on the render spacing chosen later). One entry p
                  (length < 127 when the voxel holds facades facing different ways)
   facade_count   uint32 (N,), number of samples (>= 16 per m^2 of facade)
   facade_voxel, facade_faces, facade_area_m2, facade_samples (scalars)
-The grid arrays are bit-for-bit the same as without --facades. --tag appends a suffix to the
-tile folder (--tag facades -> <spacing>m_facades/), so a facade cache never mixes with a
-grid-only one; --facades refuses to reuse cached tiles without facades.
+--no-facades writes the grid keys only (for uses that need no walls); the grid arrays are
+bit-for-bit the same either way. A tile folder holds one kind of tile only: the script refuses
+to write into a folder whose existing tiles differ from the request (facades or not, spacing,
+supersample, facade voxel size), in both directions. --tag appends a suffix to the tile folder
+(<spacing>m_<tag>/) to keep a differently built cache apart; the pipeline uses no tag.
 
 Example (Melbourne, tiles chosen by an existing simulation):
   python terrain_cache.py --dataset melbourne_2020 --spacing 1.0 \\
@@ -406,10 +408,32 @@ FACADE_KEYS = ('facade_ijk', 'facade_rgb', 'facade_normal', 'facade_count', 'fac
                'facade_faces', 'facade_area_m2', 'facade_samples')
 
 
-def has_facades(path, voxel):
-    """True if the cached tile holds facade voxels of this size."""
+def tile_kind(path):
+    """How a cached tile was built: (spacing, supersample, facade voxel size or None)."""
     with np.load(path) as data:
-        return 'facade_ijk' in data.files and abs(float(data['facade_voxel']) - voxel) < 1e-9
+        voxel = float(data['facade_voxel']) if 'facade_voxel' in data.files else None
+        return float(data['spacing']), int(data['supersample']), voxel
+
+
+def describe_kind(kind):
+    spacing, supersample, voxel = kind
+    facades = f'facades {voxel:g} m' if voxel is not None else 'no facades'
+    return f'spacing {spacing:g} m, supersample {supersample}, {facades}'
+
+
+def check_folder(output_dir, kind):
+    """Refuse a folder holding any tile built differently from kind (see tile_kind), so a cache never
+    mixes grid-only and facade tiles, spacings, supersampling or voxel sizes."""
+    found = {}
+    for path in sorted(output_dir.glob('*.npz')):
+        found.setdefault(tile_kind(path), []).append(path.stem)
+    other = {k: v for k, v in found.items() if not (abs(k[0] - kind[0]) < 1e-9 and k[1] == kind[1] and (
+        (k[2] is None) == (kind[2] is None) and (k[2] is None or abs(k[2] - kind[2]) < 1e-9)))}
+    if other:
+        lines = [f'  {len(v)} tiles with {describe_kind(k)} (e.g. {v[:3]})' for k, v in other.items()]
+        raise SystemExit(f'{output_dir} already holds tiles built differently from this request '
+                         f'({describe_kind(kind)}):\n' + '\n'.join(lines)
+                         + '\nA cache folder holds one kind of tile: use another --output or --tag.')
 
 
 # ----------------------------------------------------------------------------- one tile
@@ -560,11 +584,10 @@ def main():
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--limit', type=int, help='process only the first N selected tiles')
     parser.add_argument('--dry-run', action='store_true', help='print the selection and the estimate, do nothing')
-    parser.add_argument('--facades', action='store_true',
-                        help='also store the near-vertical faces as coloured facade voxels (needed by '
-                             'terrain_to_render.py --walls); the grid arrays are unchanged')
+    parser.add_argument('--no-facades', action='store_true',
+                        help='grid only: do not store the facade voxels (terrain_to_render.py --walls needs them)')
     parser.add_argument('--facade-voxel', type=float, default=1.0, help='facade voxel size in metres (default 1)')
-    parser.add_argument('--tag', help='suffix of the tile folder: <spacing>m_<tag> (e.g. --tag facades -> 1m_facades)')
+    parser.add_argument('--tag', help='suffix of the tile folder, <spacing>m_<tag>/ (not used by the pipeline)')
     args = parser.parse_args()
 
     dataset = load_datasets()[args.dataset]
@@ -574,15 +597,13 @@ def main():
         print(f'{output_dir / "log.jsonl"}: {kept} lines kept, {added} rebuilt', flush=True)
         return
     tiles = select_tiles(args, dataset)[:args.limit]
+    facade_voxel = None if args.no_facades else args.facade_voxel
+    # Cached tiles are reused as they are: check every tile already in the folder (not only the
+    # selected ones) before adding to it, so the folder never mixes tile kinds.
+    if output_dir.exists():
+        check_folder(output_dir, (args.spacing, args.supersample, facade_voxel))
     output_dir.mkdir(parents=True, exist_ok=True)
     todo = [t for t in tiles if not (output_dir / f'{t}.npz').exists()]
-    if args.facades:
-        # A cached tile is reused as is, so a folder of grid-only tiles must not be completed with
-        # facade tiles (or the reverse would silently lack walls): check every cached tile.
-        lacking = [t for t in tiles if t not in todo and not has_facades(output_dir / f'{t}.npz', args.facade_voxel)]
-        if lacking:
-            raise SystemExit(f'{len(lacking)} cached tiles in {output_dir} have no facades of '
-                             f'{args.facade_voxel:g} m (e.g. {lacking[:3]}); use --tag or another --output')
     print(f'{args.dataset}: {len(tiles)} tiles selected, {len(tiles) - len(todo)} cached, '
           f'{len(todo)} to process -> {output_dir}', flush=True)
     if args.dry_run:
@@ -595,7 +616,7 @@ def main():
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         jobs = {pool.submit(process_tile, args.dataset, dataset, t, output_dir, args.spacing,
                             args.supersample, args.archives, args.keep_archives,
-                            args.facade_voxel if args.facades else None): t for t in todo}
+                            facade_voxel): t for t in todo}
         for job in as_completed(jobs):  # log each tile when it completes, so an interrupted run loses no record
             tile = jobs[job]
             try:

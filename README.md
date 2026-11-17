@@ -43,51 +43,52 @@ Renders and terrain derived from it must carry that attribution.
 
 The original OBJ ZIPs (570 tiles, 113.67 GB = about 106 GiB) are no longer kept on disk.
 `terrain_cache.py` downloads one tile at a time, rasterises the upper surface of
-the textured mesh into a grid in the dataset's own projected CRS, writes a small
-compressed `.npz` and deletes the ZIP. The cache does not depend on any orbit
-simulation and is shared by every run:
+the textured mesh into a grid in the dataset's own projected CRS, samples its
+facades into coloured voxels (see "Walls" below), writes a small compressed `.npz`
+and deletes the ZIP. The cache does not depend on any orbit simulation and is
+shared by every run. There is one cache per dataset and spacing:
 
 ```
 data/terrain/<dataset>/
     dataset.json        copy of the dataset entry of terrain_datasets.json
     tile_grid.json      tile index (ArcGIS JSON) used to select tiles
-    <spacing>m/<tile>.npz   height, rgb, coverage, x0, y0, spacing, ... per tile
+    <spacing>m/<tile>.npz   grid (height, rgb, coverage, x0, y0, spacing, ...) and facade voxels
     <spacing>m/log.jsonl    one line per tile, written as each tile completes
 ```
 
 `terrain_to_render.py` then bins the cache to the render spacing (2.5 m, from
-`cameras.json`) and converts it into the local ENU frame of one simulation run.
-These render grids go to `<run>/terrain_render/` and are tied to that run's
-local frame (`cache_frame.json` guards against reuse with another frame).
-`run_orbits_melbourne.sh` runs both steps; by hand, for an existing run:
+`cameras.json`), adds the walls (`--walls`) and converts everything into the local
+ENU frame of one simulation run. These render grids go to `<run>/terrain_render/`
+and are tied to that run's local frame (`cache_frame.json` guards against reuse
+with another frame or other wall settings). `run_orbits_melbourne.sh` runs both
+steps, with walls unless `WALLS=0` (see below); by hand, for an existing run:
 
 ```bash
 python terrain_cache.py --dataset melbourne_2020 --tiles-from <run>/simulation/cameras.json \
-    --spacing 1 --workers 4 [--archives /path/to/already/downloaded/zips]
+    --spacing 1 --workers 12 [--archives /path/to/already/downloaded/zips]
 python terrain_to_render.py --cameras <run>/simulation/cameras.json \
-    --cache data/terrain/melbourne_2020/1m --dataset melbourne_2020
+    --cache data/terrain/melbourne_2020/1m --dataset melbourne_2020 --walls [--wall-threshold 2]
 ```
 
 Cached tiles are skipped, so a second run downloads nothing (`--dry-run` on either
-command shows what would be done). Measured for Melbourne in step 18 (570 tiles
-at 1 m): 113.67 GB streamed, about 75 min with 12 workers, peak disk 3.8 GB
-(ZIPs in flight), peak RSS 2.8 GB on the largest tile, final cache 236 MB. The
-cell colour is the mean of 4 x 4 sub-cell texture samples. `--rebuild-log`
-recreates missing `log.jsonl` lines from the `.npz` files present.
+command shows what would be done). The cell colour is the mean of 4 x 4 sub-cell
+texture samples. `--rebuild-log` recreates missing `log.jsonl` lines from the `.npz`
+files present.
 
-#### Walls from the photomesh facades (optional)
+A cache folder holds one kind of tile: `terrain_cache.py` refuses to add tiles to a
+folder whose existing tiles were built differently (with or without facades, spacing,
+supersample, facade voxel size), in both directions. `--no-facades` builds grid-only
+tiles (no walls possible) for other uses; give such a cache its own folder with
+`--tag` (`<spacing>m_<tag>/`, e.g. `--no-facades --tag grid` -> `1m_grid/`) or
+`--output`. The pipeline uses neither.
+
+#### Walls from the photomesh facades
 
 The grid is 2.5D: it has no facades, so oblique views of tall buildings show smeared
-roof edges. `--facades` / `--walls` add vertical walls coloured from the original facades:
+roof edges. The facade voxels of the cache and `terrain_to_render.py --walls` add
+vertical walls coloured from the original facades.
 
-```bash
-python terrain_cache.py --dataset melbourne_2020 --tiles-from <run>/simulation/cameras.json \
-    --spacing 1 --facades --tag facades --workers 12        # -> data/terrain/melbourne_2020/1m_facades/
-python terrain_to_render.py --cameras <run>/simulation/cameras.json --dataset melbourne_2020 \
-    --cache data/terrain/melbourne_2020/1m_facades --walls --output <run>/terrain_render_walls
-```
-
-- `terrain_cache.py --facades` also samples every face with |n_z| < 0.3 (at least 16 samples per
+- `terrain_cache.py` (unless `--no-facades`) samples every face with |n_z| < 0.3 (at least 16 samples per
   m^2, barycentric lattice, texel read from the full-resolution texture in the same pass) into a
   global 3D voxel grid of `--facade-voxel` metres (default 1, aligned to multiples of it in the
   dataset CRS). New keys in the same `.npz` (the grid keys are bit-for-bit unchanged):
@@ -95,9 +96,7 @@ python terrain_to_render.py --cameras <run>/simulation/cameras.json --dataset me
   (N,3) area-weighted mean sRGB, `facade_normal` int8 (N,2) = 127 x area-weighted mean of the unit
   horizontal outward normals (shorter than 127 when the voxel holds facades facing different
   ways), `facade_count` uint32 (N,) samples, plus `facade_voxel`, `facade_faces`,
-  `facade_area_m2`, `facade_samples`. `--tag facades` writes to `<spacing>m_facades/`, so the
-  grid-only cache is not touched; `--facades` refuses to reuse cached tiles without facades.
-  Walls cannot be stored in the cache because they sit on the edges of the render grid,
+  `facade_area_m2`, `facade_samples`. Walls cannot be stored in the cache because they sit on the edges of the render grid,
   whose spacing is chosen later.
 - `terrain_to_render.py --walls` puts a vertical wall on every shared edge between 4-adjacent
   render cells whose heights differ by more than `--wall-threshold` (default 2 m), from the
@@ -113,7 +112,12 @@ python terrain_to_render.py --cameras <run>/simulation/cameras.json --dataset me
   mesh per tile (two triangles per segment, same emission material) when these keys exist.
 - **Renders with and without walls must not be mixed in one experiment.** `cache_frame.json`
   records the wall settings, so `--walls` refuses an output folder made without walls and the
-  reverse; use a separate folder (e.g. `terrain_render_walls`).
+  reverse; convert into a separate folder (e.g. `terrain_render_grid`) to get the other kind.
+- `run_orbits_melbourne.sh`: `WALLS=1` (default) passes `--walls --wall-threshold
+  "$WALL_THRESHOLD"` to `terrain_to_render.py`; `WALLS=0` converts the same cache as the
+  grid only. `WALL_THRESHOLD` (default `2`, metres) is the height step above which a wall is
+  built. The choice is printed at the start of `pipeline.log`. Both render modes (frames and
+  `RENDER_MODE=raw`) read `<run>/terrain_render` through `render_swarm.py`, so both get the walls.
 
 Validation (step 22, two 3 x 3 blocks of the step-20 study, REF = original photomesh, EEVEE,
 mean |dRGB| in DN over all / near-vertical pixels, views 15 and 30 deg off nadir, N and E):
@@ -132,9 +136,10 @@ nadir |dRGB| by +0.24 DN over the grid, while improving facades from 12.7 to 8.0
 and for the 570 tiles it needs 48.2 M triangles and 11.7 GiB of GPU memory (measured, 512 px
 window), against 25.7 M triangles and 6.0 GiB with walls and 13.8 M and 3.4 GiB for the grid.
 
-Measured costs for the 570 run_v2 tiles (step 22): `terrain_cache.py --facades` streamed
-113.67 GB in 1 h 32 min with 12 workers (peak RSS 2.9 GB, as without facades), giving
-47.6 M facade voxels and a 583 MB cache (`1m`: 236 MB); `terrain_to_render.py --walls` took
+Measured costs for the 570 run_v2 tiles (step 22): `terrain_cache.py` with facades streamed
+113.67 GB in 1 h 32 min with 12 workers (peak RSS 2.9 GB, the same as grid only), giving
+47.6 M facade voxels and a 583 MB cache (grid only: 236 MB, 75 min in step 18, peak disk
+3.8 GB of ZIPs in flight); `terrain_to_render.py --walls` took
 8 min (RSS 1.2 GB) for 2,084,927 wall edges, 5,934,979 segments (colour from voxels 76.0 %,
 nearest voxel 20.8 %, lower cell 3.2 %), i.e. 25.7 M triangles instead of 13.8 M and 231 MB
 instead of 87 MB. A full chief frame (EEVEE, 8 samples) takes 7.1 GiB of GPU memory at peak
@@ -190,7 +195,9 @@ python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl
 runs on the CPU: `TERRAIN_WORKERS` (default 4) sets the number of
 `terrain_cache.py` processes and `TERRAIN_SPACING` (default `1`; `1`, `1.0` and
 `1.00` all use the same `1m/` cache folder) the cache spacing in metres;
-`MELBOURNE_ARCHIVES=/path/to/zips` reuses already downloaded ZIPs. GPU denoising
+`MELBOURNE_ARCHIVES=/path/to/zips` reuses already downloaded ZIPs. `WALLS` (default
+`1`) and `WALL_THRESHOLD` (default `2` m) choose the terrain with or without walls
+(see Terrain data, "Walls from the photomesh facades"). GPU denoising
 is disabled for these small previews so it does not introduce an unsupported
 CPU denoising pass.
 
