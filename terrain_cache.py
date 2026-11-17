@@ -23,6 +23,20 @@ Output per tile, arrays indexed [row, col] with row 0 at the SOUTH edge
             so tiles of the same dataset share one global grid)
   spacing, supersample, epsg, dataset, tile, plus timing/size metadata
 
+With --facades the same .npz also holds the near-vertical faces (|n_z| < 0.3) as coloured
+samples on a global 3D voxel grid of size --facade-voxel (default 1 m), aligned to multiples
+of it in the dataset CRS (see FacadeVoxels; terrain_to_render.py --walls turns them into walls,
+since the wall positions depend on the render spacing chosen later). One entry per voxel:
+  facade_ijk     int32 (N, 3), voxel indices: the voxel spans [i, i + 1) * facade_voxel per axis
+  facade_rgb     uint8 (N, 3), area-weighted mean sRGB colour of the samples in the voxel
+  facade_normal  int8 (N, 2), 127 x area-weighted mean of the unit horizontal outward normals
+                 (length < 127 when the voxel holds facades facing different ways)
+  facade_count   uint32 (N,), number of samples (>= 16 per m^2 of facade)
+  facade_voxel, facade_faces, facade_area_m2, facade_samples (scalars)
+The grid arrays are bit-for-bit the same as without --facades. --tag appends a suffix to the
+tile folder (--tag facades -> <spacing>m_facades/), so a facade cache never mixes with a
+grid-only one; --facades refuses to reuse cached tiles without facades.
+
 Example (Melbourne, tiles chosen by an existing simulation):
   python terrain_cache.py --dataset melbourne_2020 --spacing 1.0 \\
       --tiles-from output/.../simulation/cameras.json --workers 4
@@ -175,10 +189,130 @@ class TopViewRaster:
         return height, colour.astype(np.uint8), count.astype(np.uint8)
 
 
+# ----------------------------------------------------------------------------- facades
+
+FACADE_MAX_NZ = 0.3            # faces with |n_z| below this are facades
+FACADE_DENSITY = 16.0          # minimum samples per m^2 of facade
+MAX_SAMPLES = 4_000_000        # facade samples per vectorised batch (memory bound)
+
+
+def _lattice(k):
+    """Barycentric weights (k*k, 3) of the centroids of the k*k congruent sub-triangles.
+
+    Each sub-triangle has area A / k^2, so the centroids are an area-uniform sample.
+    """
+    i, j = np.meshgrid(np.arange(k), np.arange(k), indexing='ij')
+    up = i + j <= k - 1                      # k (k + 1) / 2 upright sub-triangles
+    down = i + j <= k - 2                    # k (k - 1) / 2 inverted ones
+    u = np.r_[(i[up] + 1 / 3) / k, (i[down] + 2 / 3) / k]
+    v = np.r_[(j[up] + 1 / 3) / k, (j[down] + 2 / 3) / k]
+    return np.c_[1 - u - v, u, v]
+
+
+class FacadeVoxels:
+    """Coloured samples of the near-vertical faces, accumulated on a global 3D voxel grid.
+
+    Facades are the faces with |n_z| < 0.3 (this already excludes undersides, n_z < -0.3).
+    Each is sampled at the centroids of a k x k barycentric lattice, k = ceil(sqrt(16 area)),
+    i.e. >= 16 area-uniform samples per m^2 (at least one per face), and each sample reads the
+    full-resolution texel at its interpolated UV. No ray casting.
+
+    Voxel (ix, iy, iz) covers [ix, ix + 1) * voxel in x (same for y, z) in the dataset CRS, so
+    tiles of a dataset share one grid. Per voxel: area-weighted mean sRGB colour, area-weighted
+    mean of the unit horizontal outward normals (outward = the OBJ winding's face normal), and
+    the number of samples.
+    """
+
+    def __init__(self, voxel, density=FACADE_DENSITY, max_nz=FACADE_MAX_NZ):
+        self.voxel, self.density, self.max_nz = voxel, density, max_nz
+        self.parts = []          # per batch: (keys int64 (n, 3), sums float64 (n, 6), counts int64 (n,))
+        self.samples = 0
+        self.faces = 0
+        self.area = 0.
+
+    def add(self, tri_xyz, tri_uv, image):
+        """Sample the facade faces among triangles (n,3,3) with UVs (n,3,2); image RGB array or None."""
+        e1, e2 = tri_xyz[:, 1] - tri_xyz[:, 0], tri_xyz[:, 2] - tri_xyz[:, 0]
+        normal = np.cross(e1, e2)
+        norm = np.linalg.norm(normal, axis=1)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            nz = normal[:, 2] / norm
+        keep = (norm > 1e-12) & (np.abs(nz) < self.max_nz)
+        if not keep.any():
+            return
+        tri_xyz, tri_uv, normal, area = tri_xyz[keep], tri_uv[keep], normal[keep], .5 * norm[keep]
+        horizontal = normal[:, :2] / np.linalg.norm(normal[:, :2], axis=1, keepdims=True)
+        k = np.maximum(1, np.ceil(np.sqrt(self.density * area))).astype(np.int64)
+        self.faces += len(area)
+        self.area += float(area.sum())
+        for kk in np.unique(k):
+            lattice = _lattice(int(kk))
+            members = np.flatnonzero(k == kk)
+            step = max(1, MAX_SAMPLES // len(lattice))
+            for start in range(0, len(members), step):
+                f = members[start:start + step]
+                self._sample(tri_xyz[f], tri_uv[f], horizontal[f], area[f] / kk ** 2, lattice, image)
+
+    def _sample(self, tri_xyz, tri_uv, horizontal, weight, lattice, image):
+        n, m = len(tri_xyz), len(lattice)
+
+        def interpolate(corners):
+            # a + u (b - a) + v (c - a): exact on axis-aligned facades (no rounding across a voxel face).
+            return (corners[:, None, 0] + lattice[None, :, 1, None] * (corners[:, None, 1] - corners[:, None, 0])
+                    + lattice[None, :, 2, None] * (corners[:, None, 2] - corners[:, None, 0])).reshape(n * m, -1)
+        xyz = interpolate(tri_xyz)
+        if image is None:
+            rgb = np.full((n * m, 3), 100, dtype=np.float64)
+        else:
+            uv = interpolate(tri_uv)
+            bad = ~np.isfinite(uv).all(1)
+            uv = np.nan_to_num(uv, nan=0., posinf=1., neginf=0.)
+            h, w = image.shape[:2]
+            x = np.clip((uv[:, 0] * w).astype(np.int64), 0, w - 1)
+            y = np.clip(((1 - uv[:, 1]) * h).astype(np.int64), 0, h - 1)
+            rgb = image[y, x].astype(np.float64)
+            rgb[bad] = 96
+        keys = np.floor(xyz / self.voxel).astype(np.int64)
+        wt = np.repeat(weight, m)
+        values = np.c_[rgb * wt[:, None], np.repeat(horizontal, m, axis=0) * wt[:, None], wt]
+        self.samples += len(keys)
+        self.parts.append(self._reduce(keys, values, np.ones(len(keys), dtype=np.int64)))
+
+    @staticmethod
+    def _reduce(keys, values, counts):
+        unique, inverse = np.unique(keys, axis=0, return_inverse=True)
+        inverse = inverse.ravel()
+        sums = np.stack([np.bincount(inverse, values[:, c], len(unique)) for c in range(values.shape[1])], 1)
+        return unique, sums, np.bincount(inverse, counts, len(unique))
+
+    def result(self):
+        """Arrays for the cache: ijk int32 (N,3), rgb uint8 (N,3), normal int8 (N,2) (x 127), count uint32 (N,)."""
+        if self.parts:
+            keys, sums, counts = self._reduce(np.concatenate([p[0] for p in self.parts]),
+                                              np.concatenate([p[1] for p in self.parts]),
+                                              np.concatenate([p[2] for p in self.parts]))
+        else:
+            keys, sums, counts = np.zeros((0, 3), np.int64), np.zeros((0, 6)), np.zeros(0, np.int64)
+        self.parts = []
+        w = sums[:, 5:6]
+        rgb = np.rint(sums[:, :3] / np.where(w > 0, w, 1)).clip(0, 255).astype(np.uint8)
+        # Mean of unit vectors, not renormalised: its length (<= 1) tells how coherent the facade
+        # directions inside the voxel are (opposite faces of a thin wall cancel out).
+        normal = np.rint(127 * sums[:, 3:5] / np.where(w > 0, w, 1)).clip(-127, 127).astype(np.int8)
+        return dict(facade_ijk=keys.astype(np.int32), facade_rgb=rgb, facade_normal=normal,
+                    facade_count=counts.astype(np.uint32), facade_voxel=self.voxel,
+                    facade_faces=self.faces, facade_area_m2=self.area, facade_samples=self.samples)
+
+
 # ----------------------------------------------------------------------------- OBJ reader
 
-def rasterise_obj_zip(archive_path, spacing, supersample):
-    """Stream the OBJ inside a ZIP into a TopViewRaster; return the reduced grid."""
+def rasterise_obj_zip(archive_path, spacing, supersample, facade_voxel=None):
+    """Stream the OBJ inside a ZIP into a TopViewRaster; return the reduced grid.
+
+    With facade_voxel (metres), the near-vertical faces are also sampled into FacadeVoxels in the
+    same pass (same decoded texture), and the facade_* arrays are added to the result. The grid
+    is computed exactly as without it.
+    """
     with zipfile.ZipFile(archive_path) as archive:
         names = archive.namelist()
         obj = next(n for n in names if n.lower().endswith('.obj'))
@@ -201,6 +335,7 @@ def rasterise_obj_zip(archive_path, spacing, supersample):
         v = uv = raster = None
         material, image_cache = None, {}
         faces = 0
+        facades = FacadeVoxels(facade_voxel) if facade_voxel else None
 
         def image_for(mat):
             if mat not in image_cache:
@@ -219,7 +354,10 @@ def rasterise_obj_zip(archive_path, spacing, supersample):
             iv = np.asarray(fv, dtype=np.int64).reshape(-1, 3)
             it = np.asarray(ft, dtype=np.int64).reshape(-1, 3)
             tri_uv = uv[it] if len(uv) else np.zeros((len(iv), 3, 2))
-            raster.add(v[iv], tri_uv, image_for(material))
+            image = image_for(material)
+            raster.add(v[iv], tri_uv, image)
+            if facades is not None:
+                facades.add(v[iv], tri_uv, image)
             faces += len(iv)
             fv.clear(); ft.clear()
 
@@ -257,15 +395,27 @@ def rasterise_obj_zip(archive_path, spacing, supersample):
             raise ValueError(f'No faces in {archive_path}')
         flush()
     height, rgb, coverage = raster.reduce(supersample)
-    return dict(height=height, rgb=rgb, coverage=coverage, x0=raster.x0, y0=raster.y0, faces=faces)
+    result = dict(height=height, rgb=rgb, coverage=coverage, x0=raster.x0, y0=raster.y0, faces=faces)
+    if facades is not None:
+        result.update(facades.result())
+    return result
 
 
 READERS = {'obj_zip': rasterise_obj_zip}
+FACADE_KEYS = ('facade_ijk', 'facade_rgb', 'facade_normal', 'facade_count', 'facade_voxel',
+               'facade_faces', 'facade_area_m2', 'facade_samples')
+
+
+def has_facades(path, voxel):
+    """True if the cached tile holds facade voxels of this size."""
+    with np.load(path) as data:
+        return 'facade_ijk' in data.files and abs(float(data['facade_voxel']) - voxel) < 1e-9
 
 
 # ----------------------------------------------------------------------------- one tile
 
-def process_tile(dataset_name, dataset, tile, output_dir, spacing, supersample, archives, keep):
+def process_tile(dataset_name, dataset, tile, output_dir, spacing, supersample, archives, keep,
+                 facade_voxel=None):
     """Download (or reuse) one archive, rasterise it, write the cache, drop the archive."""
     start = time.monotonic()
     destination = output_dir / f'{tile}.npz'
@@ -280,23 +430,32 @@ def process_tile(dataset_name, dataset, tile, output_dir, spacing, supersample, 
     archive_bytes = archive.stat().st_size
     t_download = time.monotonic() - start
     try:
-        grid = READERS[dataset['format']](archive, spacing, supersample)
+        if facade_voxel:
+            grid = READERS[dataset['format']](archive, spacing, supersample, facade_voxel=facade_voxel)
+        else:
+            grid = READERS[dataset['format']](archive, spacing, supersample)
     finally:
         if owned and not keep:
             archive.unlink(missing_ok=True)
+    facade = {k: grid[k] for k in FACADE_KEYS} if facade_voxel else {}
     temporary = destination.with_suffix('.npz.part')
     with temporary.open('wb') as stream:
         np.savez_compressed(stream, height=grid['height'], rgb=grid['rgb'], coverage=grid['coverage'],
                             x0=grid['x0'], y0=grid['y0'], spacing=spacing, supersample=supersample,
-                            epsg=dataset['projected_epsg'], dataset=dataset_name, tile=tile)
+                            epsg=dataset['projected_epsg'], dataset=dataset_name, tile=tile, **facade)
     temporary.replace(destination)
     valid = np.isfinite(grid['height'])
     record = dict(tile=tile, shape=list(grid['height'].shape), faces=grid['faces'],
                   covered_fraction=float(valid.mean()), archive_bytes=archive_bytes,
                   downloaded_bytes=downloaded, cache_bytes=destination.stat().st_size,
                   download_s=round(t_download, 1), total_s=round(time.monotonic() - start, 1))
+    if facade_voxel:
+        record.update(facade_voxel=facade_voxel, facade_voxels=int(len(grid['facade_ijk'])),
+                      facade_faces=int(grid['facade_faces']), facade_area_m2=round(float(grid['facade_area_m2']), 1),
+                      facade_samples=int(grid['facade_samples']))
     print(f"{tile}: {record['shape']}, covered {record['covered_fraction']:.1%}, "
-          f"{archive_bytes/1e6:.0f} MB -> {record['cache_bytes']/1e6:.1f} MB, {record['total_s']} s", flush=True)
+          f"{archive_bytes/1e6:.0f} MB -> {record['cache_bytes']/1e6:.1f} MB, {record['total_s']} s"
+          + (f", {record['facade_voxels']:,} facade voxels" if facade_voxel else ''), flush=True)
     return record
 
 
@@ -401,10 +560,15 @@ def main():
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--limit', type=int, help='process only the first N selected tiles')
     parser.add_argument('--dry-run', action='store_true', help='print the selection and the estimate, do nothing')
+    parser.add_argument('--facades', action='store_true',
+                        help='also store the near-vertical faces as coloured facade voxels (needed by '
+                             'terrain_to_render.py --walls); the grid arrays are unchanged')
+    parser.add_argument('--facade-voxel', type=float, default=1.0, help='facade voxel size in metres (default 1)')
+    parser.add_argument('--tag', help='suffix of the tile folder: <spacing>m_<tag> (e.g. --tag facades -> 1m_facades)')
     args = parser.parse_args()
 
     dataset = load_datasets()[args.dataset]
-    output_dir = args.output / args.dataset / f'{args.spacing:g}m'
+    output_dir = args.output / args.dataset / (f'{args.spacing:g}m' + (f'_{args.tag}' if args.tag else ''))
     if args.rebuild_log:
         kept, added = rebuild_log(output_dir)
         print(f'{output_dir / "log.jsonl"}: {kept} lines kept, {added} rebuilt', flush=True)
@@ -412,6 +576,13 @@ def main():
     tiles = select_tiles(args, dataset)[:args.limit]
     output_dir.mkdir(parents=True, exist_ok=True)
     todo = [t for t in tiles if not (output_dir / f'{t}.npz').exists()]
+    if args.facades:
+        # A cached tile is reused as is, so a folder of grid-only tiles must not be completed with
+        # facade tiles (or the reverse would silently lack walls): check every cached tile.
+        lacking = [t for t in tiles if t not in todo and not has_facades(output_dir / f'{t}.npz', args.facade_voxel)]
+        if lacking:
+            raise SystemExit(f'{len(lacking)} cached tiles in {output_dir} have no facades of '
+                             f'{args.facade_voxel:g} m (e.g. {lacking[:3]}); use --tag or another --output')
     print(f'{args.dataset}: {len(tiles)} tiles selected, {len(tiles) - len(todo)} cached, '
           f'{len(todo)} to process -> {output_dir}', flush=True)
     if args.dry_run:
@@ -423,7 +594,8 @@ def main():
     failures = []
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         jobs = {pool.submit(process_tile, args.dataset, dataset, t, output_dir, args.spacing,
-                            args.supersample, args.archives, args.keep_archives): t for t in todo}
+                            args.supersample, args.archives, args.keep_archives,
+                            args.facade_voxel if args.facades else None): t for t in todo}
         for job in as_completed(jobs):  # log each tile when it completes, so an interrupted run loses no record
             tile = jobs[job]
             try:

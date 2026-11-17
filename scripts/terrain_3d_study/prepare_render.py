@@ -3,7 +3,7 @@
   python -I prepare_render.py --study STUDY --block CBD frame
   python -I prepare_render.py --study STUDY --block CBD variant --name REF --ref-factor 4
   python -I prepare_render.py --study STUDY --block CBD variant --name DEC_16
-  python -I prepare_render.py --study STUDY --block CBD variant --name GRID   (or WALL)
+  python -I prepare_render.py --study STUDY --block CBD variant --name GRID   (or WALL, WALL2, WALL2_BLOCK)
 
 Frame (same chain as terrain_to_render.py / melbourne_overpass.py): origin = block centre in
 EPSG:7855 at height 0 -> EPSG:7844 -> ECEF (EPSG:4979 -> 4978, height used as ellipsoidal);
@@ -135,11 +135,14 @@ def make_variant(args):
     out.mkdir(parents=True, exist_ok=True)
     manifest = dict(block=block_name, variant=name, tiles=[], triangles=0, texture_megapixels=0.0)
     for tile in block['tiles']:
-        if name in ('GRID', 'WALL'):
+        if name in ('GRID', 'WALL', 'WALL2', 'WALL2_BLOCK'):
             vertices, faces, colors = grid_mesh(study / 'variants' / block_name / 'GRID' / f'{tile}.npz', frame)
-            if name == 'WALL':
-                with np.load(study / 'variants' / block_name / 'WALL' / f'{tile}.npz') as w:
+            if name != 'GRID':
+                with np.load(study / 'variants' / block_name / name / f'{tile}.npz') as w:
                     quads, qcol = w['quads'], w['rgb']  # (Q, 4, 3) EPSG:7855, (Q, 3) uint8
+                    if 'no_grid' in w.files and bool(w['no_grid']):  # WALL2_BLOCK: cells are quads too
+                        vertices, faces = np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
+                        colors = np.zeros((0, 3), dtype=np.uint8)
                 base = len(vertices)
                 qv = to_local(quads.reshape(-1, 3), frame)
                 idx = base + np.arange(len(quads) * 4).reshape(-1, 4)
