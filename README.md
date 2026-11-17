@@ -75,6 +75,74 @@ at 1 m): 113.67 GB streamed, about 75 min with 12 workers, peak disk 3.8 GB
 cell colour is the mean of 4 x 4 sub-cell texture samples. `--rebuild-log`
 recreates missing `log.jsonl` lines from the `.npz` files present.
 
+#### Walls from the photomesh facades (optional)
+
+The grid is 2.5D: it has no facades, so oblique views of tall buildings show smeared
+roof edges. `--facades` / `--walls` add vertical walls coloured from the original facades:
+
+```bash
+python terrain_cache.py --dataset melbourne_2020 --tiles-from <run>/simulation/cameras.json \
+    --spacing 1 --facades --tag facades --workers 12        # -> data/terrain/melbourne_2020/1m_facades/
+python terrain_to_render.py --cameras <run>/simulation/cameras.json --dataset melbourne_2020 \
+    --cache data/terrain/melbourne_2020/1m_facades --walls --output <run>/terrain_render_walls
+```
+
+- `terrain_cache.py --facades` also samples every face with |n_z| < 0.3 (at least 16 samples per
+  m^2, barycentric lattice, texel read from the full-resolution texture in the same pass) into a
+  global 3D voxel grid of `--facade-voxel` metres (default 1, aligned to multiples of it in the
+  dataset CRS). New keys in the same `.npz` (the grid keys are bit-for-bit unchanged):
+  `facade_ijk` int32 (N,3) voxel indices (voxel = [i, i+1) x size per axis), `facade_rgb` uint8
+  (N,3) area-weighted mean sRGB, `facade_normal` int8 (N,2) = 127 x area-weighted mean of the unit
+  horizontal outward normals (shorter than 127 when the voxel holds facades facing different
+  ways), `facade_count` uint32 (N,) samples, plus `facade_voxel`, `facade_faces`,
+  `facade_area_m2`, `facade_samples`. `--tag facades` writes to `<spacing>m_facades/`, so the
+  grid-only cache is not touched; `--facades` refuses to reuse cached tiles without facades.
+  Walls cannot be stored in the cache because they sit on the edges of the render grid,
+  whose spacing is chosen later.
+- `terrain_to_render.py --walls` puts a vertical wall on every shared edge between 4-adjacent
+  render cells whose heights differ by more than `--wall-threshold` (default 2 m), from the
+  lower to the upper height, facing the lower cell, split into segments of height <= the render
+  spacing. Segment colour: count-weighted mean of the voxels whose centre is within half a render
+  cell of the edge line horizontally, inside the segment's height range, with normal within 60 deg
+  of the wall's; else the nearest such voxel within 2 render cells; else the lower cell's colour.
+  The neighbouring tiles are loaded as a one-cell halo; a seam edge belongs to the tile holding
+  its west or south cell (a cell held by two tiles belongs to the one covering more of it), so
+  no wall is duplicated or missing. Extra keys in the render `.npz`: `wall_vertices` float32
+  (4 per segment, local frame), `wall_rgb` uint8 (same colour on the 4 corners), `wall_segments`,
+  `wall_edges`, `wall_sources`, `wall_source_counts`. `render_swarm.py` adds one `<tile>_walls`
+  mesh per tile (two triangles per segment, same emission material) when these keys exist.
+- **Renders with and without walls must not be mixed in one experiment.** `cache_frame.json`
+  records the wall settings, so `--walls` refuses an output folder made without walls and the
+  reverse; use a separate folder (e.g. `terrain_render_walls`).
+
+Validation (step 22, two 3 x 3 blocks of the step-20 study, REF = original photomesh, EEVEE,
+mean |dRGB| in DN over all / near-vertical pixels, views 15 and 30 deg off nadir, N and E):
+
+| | CBD near-vertical | CBD nadir (all) | shift | triangles (CBD block) |
+|---|---|---|---|---|
+| grid only | 20.5-22.0 | 4.19 | up to 0.12 px | 227,808 |
+| walls (`--walls`, WALL2) | 11.8-12.9 | 4.19 | <= 0.07 px | 681,638 |
+| WALL2_BLOCK (not available as an option) | 7.5-8.3 | 4.43 | <= 0.03 px | 1,039,350 |
+
+SUBURB: near-vertical 8.5-9.7 (grid) -> 6.9-7.2 DN (walls), nadir unchanged (2.41). Segment
+colour from voxels / nearest voxel / lower cell: 80.7 / 17.8 / 1.5 % (CBD), 77.8 / 21.1 / 1.0 %
+(SUBURB). WALL2_BLOCK (each cell a flat quad at its own height, a wall on every edge with any
+height difference) was measured as an alternative and is not the default: it raises the CBD
+nadir |dRGB| by +0.24 DN over the grid, while improving facades from 12.7 to 8.0 DN (15 deg N),
+and for the 570 tiles it needs 48.2 M triangles and 11.7 GiB of GPU memory (measured, 512 px
+window), against 25.7 M triangles and 6.0 GiB with walls and 13.8 M and 3.4 GiB for the grid.
+
+Measured costs for the 570 run_v2 tiles (step 22): `terrain_cache.py --facades` streamed
+113.67 GB in 1 h 32 min with 12 workers (peak RSS 2.9 GB, as without facades), giving
+47.6 M facade voxels and a 583 MB cache (`1m`: 236 MB); `terrain_to_render.py --walls` took
+8 min (RSS 1.2 GB) for 2,084,927 wall edges, 5,934,979 segments (colour from voxels 76.0 %,
+nearest voxel 20.8 %, lower cell 3.2 %), i.e. 25.7 M triangles instead of 13.8 M and 231 MB
+instead of 87 MB. A full chief frame (EEVEE, 8 samples) takes 7.1 GiB of GPU memory at peak
+(5.7 GiB held by Blender after the render; 3.7 GiB without walls) and 66 s of scene setup.
+At nadir the walls are almost invisible: chief frames 0 and 500 differ from the grid-only
+renders by 0.03 DN mean |dRGB|, 0.35 % of pixels change by more than 2 DN (around the CBD
+towers), and the phase-correlation shift is (0, 0).
+
 Adding a dataset: add an entry to `terrain_datasets.json`.
 
 - `format`: reader in `terrain_cache.READERS`. `obj_zip` expects one ZIP per tile

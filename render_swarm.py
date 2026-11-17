@@ -171,18 +171,25 @@ def main():
         with np.load(path) as data:
             vertices=data['vertices'];rgb=data['rgb'].astype(float)/255
             rows,cols=data['shape']
+            # Optional walls (terrain_to_render.py --walls): 4 corners per segment, same colour handling.
+            walls=(data['wall_vertices'],data['wall_rgb'].astype(float)/255) if 'wall_vertices' in data.files else None
         ids=np.arange(rows*cols).reshape(rows,cols)
         a=ids[:-1,:-1].ravel();b=a+1;c=a+cols;d=c+1
         faces=np.concatenate([np.stack([a,b,d],1),np.stack([a,d,c],1)])
-        mesh=bpy.data.meshes.new(tile)
-        mesh.from_pydata(vertices.tolist(),[],faces.tolist());mesh.update()
-        attribute=mesh.color_attributes.new(name='Color',type='FLOAT_COLOR',domain='POINT')
-        # PNG textures are sRGB; Blender FLOAT_COLOR attributes are scene linear.
-        linear=np.where(rgb<=.04045,rgb/12.92,((rgb+.055)/1.055)**2.4)
-        rgba=np.c_[linear,np.ones(len(rgb))].astype(np.float32)
-        attribute.data.foreach_set('color',rgba.ravel())
-        obj=bpy.data.objects.new(tile,mesh);scene.collection.objects.link(obj)
-        obj.data.materials.append(material);triangles+=len(faces)
+        meshes=[(tile,vertices,faces,rgb)]
+        if walls is not None and len(walls[0]):
+            q=np.arange(len(walls[0])).reshape(-1,4)
+            meshes.append((tile+'_walls',walls[0],np.concatenate([q[:,[0,1,2]],q[:,[0,2,3]]]),walls[1]))
+        for name,mesh_vertices,mesh_faces,mesh_rgb in meshes:
+            mesh=bpy.data.meshes.new(name)
+            mesh.from_pydata(mesh_vertices.tolist(),[],mesh_faces.tolist());mesh.update()
+            attribute=mesh.color_attributes.new(name='Color',type='FLOAT_COLOR',domain='POINT')
+            # PNG textures are sRGB; Blender FLOAT_COLOR attributes are scene linear.
+            linear=np.where(mesh_rgb<=.04045,mesh_rgb/12.92,((mesh_rgb+.055)/1.055)**2.4)
+            rgba=np.c_[linear,np.ones(len(mesh_rgb))].astype(np.float32)
+            attribute.data.foreach_set('color',rgba.ravel())
+            obj=bpy.data.objects.new(name,mesh);scene.collection.objects.link(obj)
+            obj.data.materials.append(material);triangles+=len(mesh_faces)
     if missing: raise RuntimeError(f'Missing {len(missing)} selected terrain caches: {missing}')
     camera_data=bpy.data.cameras.new('HyperScape100 full-frame RGB approximation')
     camera=bpy.data.objects.new('SatelliteCamera',camera_data)

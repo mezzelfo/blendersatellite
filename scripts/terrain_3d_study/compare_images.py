@@ -13,6 +13,11 @@ on luminance multiplied by the domain mask in both images: mov(x) ~ ref(x + shif
 Also the fraction of domain pixels that are vertical, and of domain pixels the variant leaves
 transparent.
 
+Step 22: --variants restricts the variants compared, --extra-renders adds a second render root
+(STUDY/wall2/renders/<block>/<variant>/) searched before STUDY/renders, and --out writes metrics.json
+and mosaics elsewhere than STUDY/compare (which then stays as step 20 left it). With
+--mosaic-variants the mosaic columns can be chosen (default GRID, DEC_16, WALL).
+
 Mosaics (C.4): per block and view, top row REF | GRID | DEC_16 | WALL (those present), bottom row
 |variant - REF| x 10 (the REF slot shows the near-vertical mask), 256 x 256 px window with the most
 vertical pixels (ties: the one centred closest to the REF footprint), nearest-neighbour x 4. Written to STUDY/compare/mosaics/<block>_<view>.png.
@@ -79,15 +84,28 @@ def main():
     parser.add_argument('--study', type=Path, required=True)
     parser.add_argument('--ref', required=True, help='BLOCK=REF_xK,... reference render folder per block')
     parser.add_argument('--window', type=int, default=256)
+    parser.add_argument('--variants', help='comma-separated variants to compare (default: every folder)')
+    parser.add_argument('--extra-renders', type=Path, help='second render root, searched first')
+    parser.add_argument('--out', type=Path, help='default STUDY/compare')
+    parser.add_argument('--mosaic-variants', default=','.join(MOSAIC_VARIANTS))
+    parser.add_argument('--views', help='comma-separated views (default: every REF view)')
     args = parser.parse_args()
     refs = dict(item.split('=') for item in args.ref.split(','))
-    out = args.study / 'compare'
+    out = args.out or args.study / 'compare'
     (out / 'mosaics').mkdir(parents=True, exist_ok=True)
+    mosaic_variants = args.mosaic_variants.split(',')
     rows = []
     for block, ref_name in refs.items():
         root = args.study / 'renders' / block
-        variants = sorted(p.name for p in root.iterdir() if p.is_dir() and p.name != ref_name)
+        roots = ([args.extra_renders / block] if args.extra_renders else []) + [root]
+        if args.variants:
+            variants = args.variants.split(',')
+        else:
+            variants = sorted({p.name for r in roots if r.exists() for p in r.iterdir()
+                               if p.is_dir() and p.name != ref_name})
         views = sorted(p.stem for p in (root / ref_name).glob('*.png') if not p.stem.endswith('_vert'))
+        if args.views:
+            views = [v for v in views if v in args.views.split(',')]
         for view in views:
             ref, ref_alpha = load(root / ref_name / f'{view}.png')
             vert_img, _ = load(root / ref_name / f'{view}_vert.png')
@@ -95,12 +113,13 @@ def main():
             vertical = domain & (vert_img[..., 0] > 127.5)
             panels = {ref_name: ref}
             for variant in variants:
-                path = root / variant / f'{view}.png'
-                if not path.exists():
+                path = next((r / variant / f'{view}.png' for r in roots if (r / variant / f'{view}.png').exists()),
+                            None)
+                if path is None:
                     continue
                 var, var_alpha = load(path)
                 panels[variant] = var
-                row = dict(block=block, view=view, ref=ref_name, variant=variant,
+                row = dict(block=block, view=view, ref=ref_name, variant=variant, image=str(path),
                            vertical_fraction=float(vertical.sum() / domain.sum()),
                            all=metrics(ref, var, var_alpha, domain),
                            vertical=metrics(ref, var, var_alpha, vertical))
@@ -112,7 +131,7 @@ def main():
             # Mosaic.
             size = min(args.window, ref.shape[0])
             y, x = best_window(vertical, size, domain)
-            names = [ref_name] + [n for n in MOSAIC_VARIANTS if n in panels]
+            names = [ref_name] + [n for n in mosaic_variants if n in panels]
             top, bottom = [], []
             for name in names:
                 img = panels[name][y:y + size, x:x + size]
