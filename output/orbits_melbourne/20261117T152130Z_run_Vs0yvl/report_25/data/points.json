@@ -1,0 +1,212 @@
+{
+ "0": {
+  "bright roof": {
+   "line_index": 72,
+   "col_index": 189,
+   "g": 1005,
+   "col": 1111,
+   "rule": "highest 5x5 luminance among homogeneous pixels"
+  },
+  "road": {
+   "line_index": 61,
+   "col_index": 399,
+   "g": 994,
+   "col": 1321,
+   "rule": "least saturated homogeneous pixel within 15% of the median luminance (grey surface)"
+  },
+  "vegetation": {
+   "line_index": 70,
+   "col_index": 1414,
+   "g": 1003,
+   "col": 2336,
+   "rule": "largest excess green 2G-R-B, G > R and G > B"
+  },
+  "water": {
+   "line_index": 61,
+   "col_index": 798,
+   "g": 994,
+   "col": 1720,
+   "rule": "darkest homogeneous pixel with B > R in the darkest 5%"
+  }
+ },
+ "1": {
+  "bright roof": {
+   "line_index": 55,
+   "col_index": 106,
+   "g": 1011,
+   "col": 1044,
+   "rule": "highest 5x5 luminance among homogeneous pixels"
+  },
+  "road": {
+   "line_index": 16,
+   "col_index": 376,
+   "g": 972,
+   "col": 1314,
+   "rule": "least saturated homogeneous pixel within 15% of the median luminance (grey surface)"
+  },
+  "vegetation": {
+   "line_index": 16,
+   "col_index": 570,
+   "g": 972,
+   "col": 1508,
+   "rule": "largest excess green 2G-R-B, G > R and G > B"
+  },
+  "water": {
+   "line_index": 54,
+   "col_index": 785,
+   "g": 1010,
+   "col": 1723,
+   "rule": "darkest homogeneous pixel with B > R in the darkest 5%"
+  }
+ },
+ "2": {
+  "bright roof": {
+   "line_index": 73,
+   "col_index": 189,
+   "g": 1006,
+   "col": 1111,
+   "rule": "highest 5x5 luminance among homogeneous pixels"
+  },
+  "road": {
+   "line_index": 8,
+   "col_index": 301,
+   "g": 941,
+   "col": 1223,
+   "rule": "least saturated homogeneous pixel within 15% of the median luminance (grey surface)"
+  },
+  "vegetation": {
+   "line_index": 70,
+   "col_index": 1414,
+   "g": 1003,
+   "col": 2336,
+   "rule": "largest excess green 2G-R-B, G > R and G > B"
+  },
+  "water": {
+   "line_index": 61,
+   "col_index": 798,
+   "g": 994,
+   "col": 1720,
+   "rule": "darkest homogeneous pixel with B > R in the darkest 5%"
+  }
+ },
+ "3": {
+  "bright roof": {
+   "line_index": 56,
+   "col_index": 108,
+   "g": 1010,
+   "col": 1044,
+   "rule": "highest 5x5 luminance among homogeneous pixels"
+  },
+  "road": {
+   "line_index": 6,
+   "col_index": 285,
+   "g": 960,
+   "col": 1221,
+   "rule": "least saturated homogeneous pixel within 15% of the median luminance (grey surface)"
+  },
+  "vegetation": {
+   "line_index": 17,
+   "col_index": 572,
+   "g": 971,
+   "col": 1508,
+   "rule": "largest excess green 2G-R-B, G > R and G > B"
+  },
+  "water": {
+   "line_index": 56,
+   "col_index": 790,
+   "g": 1010,
+   "col": 1726,
+   "rule": "darkest homogeneous pixel with B > R in the darkest 5%"
+  }
+ },
+ "4": {
+  "bright roof": {
+   "line_index": 55,
+   "col_index": 106,
+   "g": 1011,
+   "col": 1045,
+   "rule": "highest 5x5 luminance among homogeneous pixels"
+  },
+  "road": {
+   "line_index": 31,
+   "col_index": 41,
+   "g": 987,
+   "col": 980,
+   "rule": "least saturated homogeneous pixel within 15% of the median luminance (grey surface)"
+  },
+  "vegetation": {
+   "line_index": 16,
+   "col_index": 569,
+   "g": 972,
+   "col": 1508,
+   "rule": "largest excess green 2G-R-B, G > R and G > B"
+  },
+  "water": {
+   "line_index": 54,
+   "col_index": 784,
+   "g": 1010,
+   "col": 1723,
+   "rule": "darkest homogeneous pixel with B > R in the darkest 5%"
+  }
+ },
+ "5": {
+  "bright roof": {
+   "line_index": 73,
+   "col_index": 189,
+   "g": 1006,
+   "col": 1111,
+   "rule": "highest 5x5 luminance among homogeneous pixels"
+  },
+  "road": {
+   "line_index": 10,
+   "col_index": 285,
+   "g": 943,
+   "col": 1207,
+   "rule": "least saturated homogeneous pixel within 15% of the median luminance (grey surface)"
+  },
+  "vegetation": {
+   "line_index": 70,
+   "col_index": 1414,
+   "g": 1003,
+   "col": 2336,
+   "rule": "largest excess green 2G-R-B, G > R and G > B"
+  },
+  "water": {
+   "line_index": 61,
+   "col_index": 798,
+   "g": 994,
+   "col": 1720,
+   "rule": "darkest homogeneous pixel with B > R in the darkest 5%"
+  }
+ },
+ "6": {
+  "bright roof": {
+   "line_index": 56,
+   "col_index": 108,
+   "g": 1009,
+   "col": 1043,
+   "rule": "highest 5x5 luminance among homogeneous pixels"
+  },
+  "road": {
+   "line_index": 8,
+   "col_index": 294,
+   "g": 961,
+   "col": 1229,
+   "rule": "least saturated homogeneous pixel within 15% of the median luminance (grey surface)"
+  },
+  "vegetation": {
+   "line_index": 17,
+   "col_index": 572,
+   "g": 970,
+   "col": 1507,
+   "rule": "largest excess green 2G-R-B, G > R and G > B"
+  },
+  "water": {
+   "line_index": 57,
+   "col_index": 789,
+   "g": 1010,
+   "col": 1724,
+   "rule": "darkest homogeneous pixel with B > R in the darkest 5%"
+  }
+ }
+}

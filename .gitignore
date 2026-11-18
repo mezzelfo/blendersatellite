@@ -35,3 +35,9 @@ OBJ/
 *.blend
 *.blend1
 # Track3-RGB-crops/
+# step 25: band samples of the cubes and the cube-mode report of the async run
+!output/orbits_melbourne/20261117T152130Z_run_Vs0yvl/
+!output/orbits_melbourne/20261117T152130Z_run_Vs0yvl/band_samples/
+!output/orbits_melbourne/20261117T152130Z_run_Vs0yvl/band_samples/**
+!output/orbits_melbourne/20261117T152130Z_run_Vs0yvl/report_25/
+!output/orbits_melbourne/20261117T152130Z_run_Vs0yvl/report_25/**
