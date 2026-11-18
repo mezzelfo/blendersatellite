@@ -3,7 +3,8 @@
 # Vulkan backend, looping over its satellites one Blender invocation each, with
 # --frames 0:1000 --skip-existing. Relaunching the same command resumes where it stopped.
 # Usage: scripts/render_job.sh NVSMI_GPU "SATELLITES" [--check-only]
-#   NVSMI_GPU   physical GPU as numbered by nvidia-smi (0 or 1)
+#   NVSMI_GPU   physical GPU as numbered by nvidia-smi
+# (Superseded by scripts/render_pool.py, which uses every GPU with a shared task queue.)
 #   SATELLITES  space-separated satellite ids, e.g. "0 1 2 3"
 # Environment: OUTPUT (renders folder), CAMERAS, TERRAIN (default <run of CAMERAS>/terrain_render),
 #   BLENDER_BIN, FRAMES (default 0:1000).
@@ -37,13 +38,20 @@ if [[ "$output_real" == "$(realpath -m -- "$EEVEE_FULL")" || "$output_real" == "
 fi
 FRAMES="${FRAMES:-0:1000}"
 NVSMI_GPU="$1"; SATELLITES="$2"; MODE="${3:-}"
-# Vulkan enumerates the two TITAN Xp in the opposite order of nvidia-smi on osiride
-# (measured in step 7); the probe below aborts if that ever changes.
-case "$NVSMI_GPU" in
-    0) VK_DEVICE="${VK_DEVICE:-1}" ;;
-    1) VK_DEVICE="${VK_DEVICE:-0}" ;;
-    *) echo "NVSMI_GPU must be 0 or 1" >&2; exit 1 ;;
-esac
+# The Vulkan device order is not the nvidia-smi order in general: unless VK_DEVICE is set, find the
+# Vulkan device that sits on this GPU's UUID with the probe (it also checks a given VK_DEVICE below).
+EXPECTED_UUID="$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$NVSMI_GPU")" || {
+    echo "nvidia-smi has no GPU $NVSMI_GPU" >&2; exit 1; }
+if [[ -z "${VK_DEVICE:-}" ]]; then
+    for candidate in 0 1 2 3 4 5 6 7; do
+        if "$BLENDER_BIN" --background --factory-startup --gpu-backend vulkan --gpu-device "$candidate" \
+                --gpu-device-no-fallback --python "$PROJECT_DIR/scripts/vulkan_gpu_probe.py" -- "$EXPECTED_UUID" \
+                >/dev/null 2>&1; then
+            VK_DEVICE="$candidate"; break
+        fi
+    done
+    [[ -n "${VK_DEVICE:-}" ]] || { echo "no Vulkan device runs on nvidia-smi GPU $NVSMI_GPU ($EXPECTED_UUID)" >&2; exit 1; }
+fi
 GPU_OPTS=(--gpu-backend vulkan --gpu-device "$VK_DEVICE" --gpu-device-no-fallback)
 mkdir -p "$OUTPUT" "$OUTPUT/../logs"
 LOGS="$(cd -- "$OUTPUT/.." && pwd)/logs"
@@ -58,7 +66,6 @@ if [[ "$MODE" == --check-only ]]; then
     done
     exit 0
 fi
-EXPECTED_UUID="$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$NVSMI_GPU")"
 if ! probe="$("$BLENDER_BIN" --background --factory-startup "${GPU_OPTS[@]}" \
         --python "$PROJECT_DIR/scripts/vulkan_gpu_probe.py" -- "$EXPECTED_UUID" 2>&1)"; then
     echo "$probe" | grep 'GPU probe' >&2 || true

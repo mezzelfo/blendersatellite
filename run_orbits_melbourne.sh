@@ -17,6 +17,15 @@ case "$WALLS" in
     *) echo "WALLS must be 0 or 1, not '$WALLS'" >&2; exit 1 ;;
 esac
 MELBOURNE_BLENDER_BIN="${BLENDER_BIN:-/snap/blender/current/blender}"
+# Rendering hardware (scripts/render_pool.py, both render modes): GPUS=all or a list of GPUs
+# (nvidia-smi index or UUID), MAX_WORKERS_PER_GPU (default 4) caps the Blender workers per GPU,
+# whose number is otherwise chosen from the measured GPU memory; WORKERS_PER_GPU=N fixes it;
+# DEVICE_MAP=GPU=BLENDER_DEVICE,... overrides the device probe; RENDER_CHUNK frames per task.
+GPUS="${GPUS:-all}"
+MAX_WORKERS_PER_GPU="${MAX_WORKERS_PER_GPU:-4}"
+POOL_OPTS=(--gpus "$GPUS" --max-workers-per-gpu "$MAX_WORKERS_PER_GPU" --chunk "${RENDER_CHUNK:-20}")
+if [[ -n "${WORKERS_PER_GPU:-}" ]]; then POOL_OPTS+=(--workers-per-gpu "$WORKERS_PER_GPU"); fi
+if [[ -n "${DEVICE_MAP:-}" ]]; then POOL_OPTS+=(--device-map "$DEVICE_MAP"); fi
 RUNS_ROOT="${RUNS_ROOT:-$PROJECT_DIR/output/orbits_melbourne}"
 FORMATION="${FORMATION:-train}"
 TRAIN_SPACING_M="${TRAIN_SPACING_M:-1000}"
@@ -51,6 +60,7 @@ if [[ "$WALLS" == 1 ]]; then
 else
     echo "Terrain: cache spacing $TERRAIN_SPACING m, walls OFF (WALLS=0, grid only)"
 fi
+echo "Render hardware: GPUS=$GPUS, MAX_WORKERS_PER_GPU=$MAX_WORKERS_PER_GPU${WORKERS_PER_GPU:+, WORKERS_PER_GPU=$WORKERS_PER_GPU}${DEVICE_MAP:+, DEVICE_MAP=$DEVICE_MAP} (decision logged by render_pool below)"
 trap 'echo "Run exited with status $?; artifacts: $RUN_DIR"' EXIT
 ARCHIVE_OPTS=()
 if [[ -n "${MELBOURNE_ARCHIVES:-}" && -d "$MELBOURNE_ARCHIVE_DIR" ]]; then
@@ -87,17 +97,19 @@ conda run --no-capture-output -n orbits python "$PROJECT_DIR/terrain_cache.py" \
 conda run --no-capture-output -n orbits python "$PROJECT_DIR/terrain_to_render.py" \
     --cameras "$ORBITS_RUN_DIR/cameras.json" \
     --cache "$TERRAIN_CACHE_DIR" --dataset melbourne_2020 ${WALL_OPTS[@]+"${WALL_OPTS[@]}"}
+# Both render modes run persistent Blender workers on every selected GPU (scripts/render_pool.py);
+# worker logs are in renders/queue/logs/, the hardware and sizing decisions in this log.
 if [[ "${RENDER_MODE:-frames}" == raw ]]; then
     # Keep only the band rows (raw/) and one reference frame every 100; see scripts/render_to_raw.py.
     conda run --no-capture-output -n orbits python "$PROJECT_DIR/scripts/render_to_raw.py" \
         --cameras "$ORBITS_RUN_DIR/cameras.json" --terrain "$RUN_DIR/terrain_render" \
-        --output "$RENDER_DIR" --blender "$MELBOURNE_BLENDER_BIN" \
-        --n-bands "${RAW_BANDS:-32}" --tdi-rows "${RAW_TDI_ROWS:-8}" --block "${RAW_BLOCK:-100}" \
+        --output "$RENDER_DIR" --blender "$MELBOURNE_BLENDER_BIN" "${POOL_OPTS[@]}" \
+        --n-bands "${RAW_BANDS:-32}" --tdi-rows "${RAW_TDI_ROWS:-8}" \
         --ref-every "${RAW_REF_EVERY:-100}" ${RAW_KEEP_FRAMES:+--keep-frames} -- "$@"
 else
-    "$MELBOURNE_BLENDER_BIN" --background --factory-startup --python-exit-code 1 \
-        --python "$PROJECT_DIR/render_swarm.py" -- \
+    # Every frame as PNG; --frames/--satellites/--crop in "$@" are honoured, --check-only runs one process.
+    conda run --no-capture-output -n orbits python "$PROJECT_DIR/scripts/render_pool.py" \
         --cameras "$ORBITS_RUN_DIR/cameras.json" --terrain "$RUN_DIR/terrain_render" \
-        --output "$RENDER_DIR" "$@"
+        --output "$RENDER_DIR" --blender "$MELBOURNE_BLENDER_BIN" "${POOL_OPTS[@]}" -- "$@"
 fi
 echo "Completed run: $RUN_DIR"

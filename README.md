@@ -180,8 +180,9 @@ Activate the `orbits` conda environment, then run from this directory:
 bash run_orbits_melbourne.sh
 ```
 
-The wrapper requires CUDA: orbit integration defaults to `cuda:0`, and Cycles uses both detected CUDA GPUs with CPU rendering
-disabled. Missing GPU access is an error; it does not silently fall back to CPU.
+The wrapper requires CUDA for the orbit integration (default `cuda:0`). Rendering uses every
+GPU it finds (see "Rendering on every GPU" below); without any GPU, Cycles falls back to one CPU
+worker, while EEVEE stops with an error.
 The installed PyTorch build is `2.10.0+cu126`, compatible with the TITAN Xp's
 Pascal architecture. To recreate it, install PyTorch before the other dependencies:
 
@@ -190,8 +191,8 @@ python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl
 ```
 
 `ORBITS_DEVICE` selects the numerical CUDA device;
-`--gpu-devices 0` selects one Cycles GPU instead of both. Orbit metadata and
-`render_report.json` record the actual selected devices. Terrain preparation
+`GPUS=0` renders on one GPU instead of all (`--gpu-devices` is set per worker by the pool). Orbit
+metadata and `render_report.jsonl` record the actual selected devices. Terrain preparation
 runs on the CPU: `TERRAIN_WORKERS` (default 4) sets the number of
 `terrain_cache.py` processes and `TERRAIN_SPACING` (default `1`; `1`, `1.0` and
 `1.00` all use the same `1m/` cache folder) the cache spacing in metres;
@@ -237,18 +238,86 @@ the time of the chief. `orbits/scripts/validate_acquisition.py` checks an export
 `RENDER_MODE=raw` keeps only the raw pushbroom data instead of the full frames
 (`scripts/render_to_raw.py`): frames 0 and 999 fix the detector rows that see the
 scene over the whole window for every satellite, 32 bands of 8 adjacent rows (start
-rows multiples of 4) are spread over them, and the run is rendered in blocks of 100
-frames. After each block the rows are written to `raw/sat_SS.npy` (uint8
-[256, 1000, 4096, 4], raw[i, k, c] = PNG pixel (rows[i], c) of frame k), read back,
-compared with the PNGs, and the PNGs are deleted except one reference frame every
-100 (and the last), moved to `reference_frames/`. About 4.2 GB per satellite instead
-of 8.2 GB of PNGs; launching the same command again resumes from `raw/progress.json`.
+rows multiples of 4) are spread over them, and the run is rendered as tasks of
+`RENDER_CHUNK` (default 20) frames of one satellite, the chunks with frames 0 and 999
+first. As soon as a task is done (and the band rows are known) its rows are written to
+`raw/sat_SS.npy` (uint8 [256, 1000, 4096, 4], raw[i, k, c] = PNG pixel (rows[i], c) of
+frame k), read back, compared with the PNGs, and the PNGs are deleted except one reference
+frame every 100 (and the last), moved to `reference_frames/`, while the workers go on
+rendering. About 4.2 GB per satellite instead of 8.2 GB of PNGs; launching the same command
+again resumes from `raw/progress.json` (extracted (satellite, frame) pairs under `done`;
+`frames` lists the frames extracted for every satellite, as before).
 Example: `ACQUISITION=hex7_async_10deg.json RENDER_MODE=raw bash run_orbits_melbourne.sh --engine EEVEE`.
 Do not pass `--frames` or `--satellites` in this mode.
 `RAW_KEEP_FRAMES=1` extracts the raw rows but keeps every PNG (no deletion).
+`RAW_BLOCK` is gone (replaced by `RENDER_CHUNK`).
 `scripts/build_cubes.py --run RUN --layout raw_bands --mode none|linear|bilinear --source raw|png`
 builds the cubes on the ground from either source (identical results); `bilinear` follows the
 column drift of oblique (fore/aft) views, `linear` keeps the column fixed, `none` steps whole frames.
+#### Rendering on every GPU (`scripts/render_pool.py`)
+
+Both render modes run persistent Blender workers on every selected GPU, fed by a task queue.
+Nothing is specific to one machine: devices are found and identified at start.
+
+- **Devices.** The GPUs are listed with `nvidia-smi` (index, UUID, PCI bus id, memory) when it
+  is present, else from the devices Blender reports. Each GPU is mapped to Blender's device by
+  identity, never by position. EEVEE: one Blender probe per Vulkan device
+  (`scripts/vulkan_gpu_probe.py --json`, run with `--gpu-backend vulkan --gpu-device N
+  --gpu-device-no-fallback`) renders a 64 px image and reads its own UUID from `nvidia-smi`;
+  software devices (llvmpipe) are dropped. On osiride (Blender 5.3) Vulkan 0 = nvidia-smi GPU 1
+  and Vulkan 1 = GPU 0, Vulkan 2 = llvmpipe. Without Vulkan, OpenGL gives one worker on the
+  device the driver picks. Cycles: the device ids carry the PCI bus id
+  (`CUDA_NVIDIA TITAN Xp_0000:41:00`), matched with `nvidia-smi`; each worker gets
+  `--gpu-devices <id>` (`render_swarm.py --gpu-devices` now takes indices, ids or `cpu`).
+  No GPU: one CPU Cycles worker (EEVEE needs a GPU).
+- **Options** (`render_to_raw.py` and `render_pool.py`; environment of
+  `run_orbits_melbourne.sh` in brackets): `--gpus all|LIST` (`GPUS`, default all; nvidia-smi
+  index or UUID, `bN` = Blender device N), `--device-map GPU=BLENDER_DEVICE,...` (`DEVICE_MAP`)
+  where the probe cannot identify a device, `--max-workers-per-gpu` (`MAX_WORKERS_PER_GPU`,
+  default 4), `--workers-per-gpu N` (`WORKERS_PER_GPU`, fixed number, no measuring),
+  `--chunk` (`RENDER_CHUNK`, default 20 frames), `--gpu-memory-margin` (MiB, default 1024),
+  `--ram-margin` (MiB, default 4096), `--workers` (extraction processes, default the cores not
+  taken by render workers).
+- **Queue** (`renders/queue/`): `pending/`, `claimed/` (a worker claims a task by an atomic
+  rename), `done/` (marker with the task's poses and timings), `extracted/` (raw mode: written
+  after the rows are verified, before the PNGs are deleted), `workers/` (status), `logs/`
+  (one Blender log per worker), `events.jsonl` (worker start/exit, sizing decisions,
+  extraction timings), `config.json` (chunk and selection; a resume must use the same). Each
+  worker (`render_swarm.py --task-queue`) loads the scene once (about 65 s) and claims tasks
+  until none is left, so faster GPUs take more tasks. A dead worker's task goes back to
+  `pending/` and the others finish the run; if every worker dies the driver exits non-zero.
+  Rerunning the same command resumes; workers of a killed driver notice it at the next frame
+  and exit, and the new driver stops any that are left.
+- **Workers per GPU.** One worker per GPU first. After its first task the driver takes the
+  worker's peak GPU memory (`nvidia-smi` per process, sampled by the worker after each task
+  and every `--coverage-every` frames, and by the driver every 2 s; else the drop of the
+  device's free memory) and adds a worker on
+  that GPU while (free memory - margin) > memory per worker, up to `--max-workers-per-gpu`,
+  the CPU count and the host memory. The free memory is the smaller of the current reading
+  and (free before the first worker - workers x peak), because an EEVEE worker's memory swings
+  within every render (2.5 to 7.2 GiB with walls). Each decision goes to the log (pipeline.log)
+  and `events.jsonl`. With walls on a 12 GiB TITAN Xp this gives one worker per GPU.
+- **Results do not depend on the hardware**: the same PNGs and raw files bit for bit whatever
+  the number of GPUs and workers (checked in step 24). For this `render_swarm.py` no longer
+  writes the render date and render time into the PNG metadata (Blender's default text chunks
+  `Date`, `RenderTime`); the pixels of earlier runs are unchanged, only those two chunks are
+  gone. PNGs are written under a temporary name
+  and renamed, so a killed worker never leaves a truncated frame. `poses.jsonl` is written by
+  the driver at the end, sorted by frame; `render_report.jsonl` has one header per worker
+  (with `worker_id`) and its frame lines in completion order.
+- **CPU side of a frame** (walls, one worker, step 24b): 3.43 s = render call 2.40 + PNG write
+  0.99 + rest 0.03. `render_swarm.py --coverage-every` defaults to 50 (the PNG reload for the
+  alpha coverage and the `nvidia-smi` snapshot cost 0.25 s when done every frame).
+  `--png-compression` (default 15, as Blender) sets the PNG zlib level: Blender maps 0..100 to
+  zlib 0..9 and every value below 10 stores the image uncompressed (48 MiB per frame instead of
+  7.5 MiB) for 0.17 s less per frame (-5%); pixels and raw files are identical. The raw mode
+  keeps 15: with 0 its PNGs in flight and the reference frames take 6.4x the disk.
+- **Frames mode** (`RENDER_MODE` unset) runs `scripts/render_pool.py`, the same pool without
+  extraction; `--frames`, `--satellites` and `--crop` after the wrapper are honoured,
+  `--check-only` runs one process as before. `render_swarm.py` alone still works as before
+  (`--frames` now defaults to every epoch). `scripts/render_job.sh` is superseded; it now finds
+  its Vulkan device with the probe instead of a fixed osiride mapping.
+
 Every invocation creates a fresh directory such as
 `output/orbits_melbourne/20261028T171037Z_run_8bJvD7/`; the UTC timestamp plus
 unique suffix prevents collisions even for simultaneous runs. `RUNS_ROOT`

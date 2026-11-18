@@ -1,5 +1,6 @@
-"""render_to_raw.py with a fake renderer (synthetic PNGs, no Blender)."""
+"""render_to_raw.py with a fake worker pool (synthetic PNGs, no Blender)."""
 import json
+import os
 from argparse import Namespace
 from pathlib import Path
 
@@ -34,27 +35,57 @@ def make_args(tmp, **kw):
     cams = tmp / 'cameras.json'
     cams.write_text(json.dumps(dict(epochs=epochs, frame_period_s=1e-3)))
     a = dict(cameras=cams, terrain=tmp / 'terrain', output=tmp / 'run' / 'renders', raw=None, references=None,
-             satellites=None, n_bands=3, tdi_rows=2, block=10, ref_every=10, workers=2, render_args=[])
+             satellites=None, n_bands=3, tdi_rows=2, chunk=10, ref_every=10, workers=2, render_args=[],
+             queue=None, workers_per_gpu=None, max_workers_per_gpu=4)
     a.update(kw)
     return Namespace(**a)
 
 
-class FakeRender:
+class FakePool:
+    """Stands in for render_pool.WorkerPool: each poll() claims one pending task like a worker
+    (rename to claimed/), writes its synthetic PNGs and its done marker."""
+
     def __init__(self, fail_at=None):
         self.calls, self.fail_at = [], fail_at
+        self.devices, self.decisions = [dict(kind='gpu', label='0')], []
 
-    def __call__(self, args, start, stop, sats):
-        self.calls.append((start, stop))
+    def __call__(self, args, queue, n_tasks):                      # make_pool
+        self.args, self.queue = args, queue
+        return self
+
+    def start(self):
+        pass
+
+    def alive(self, device=None):
+        return []
+
+    def stop(self):
+        self.queue.requeue()
+
+    def summary(self):
+        return []
+
+    def poll(self):
+        names = sorted(n for n in os.listdir(self.queue.pending) if n.endswith('.json'))
+        if not names:
+            return 1
+        claimed = self.queue.claimed / f'{names[0][:-5]}@fake.json'
+        os.rename(self.queue.pending / names[0], claimed)
+        task = json.loads(claimed.read_text())
+        s, (start, stop) = task['satellite'], task['frames']
+        self.calls.append((s, start, stop))
         if self.fail_at is not None and start == self.fail_at:
             self.fail_at = None
             raise RuntimeError('simulated crash')
-        for s in sats:
-            for k in range(start, stop):
-                p = rr.frame_png(args.output, s, k)
-                if p.exists():
-                    continue
+        for k in range(start, stop):
+            p = rr.frame_png(self.args.output, s, k)
+            if not p.exists():
                 p.parent.mkdir(parents=True, exist_ok=True)
                 Image.fromarray(truth(s, k), 'RGBA').save(p)
+        (self.queue.done / f'{names[0]}').write_text(json.dumps(dict(
+            satellite=s, frames=[start, stop], poses=[dict(satellite_id=s, frame=k) for k in range(start, stop)])))
+        claimed.unlink()
+        return 1
 
 
 def test_select_band_rows():
@@ -70,12 +101,13 @@ def test_select_band_rows():
 
 def test_render_to_raw_with_resume(tmp_path):
     args = make_args(tmp_path)
-    render = FakeRender(fail_at=10)
+    pool = FakePool(fail_at=10)
     with pytest.raises(RuntimeError):
-        rr.run_main(args, render)                       # crashes on block 10..19
-    rr.run_main(args, render)                           # resumes
-    assert render.calls[:2] == [(0, 1), (F - 1, F)]    # frames for the band rows
-    assert (10, 20) in render.calls and render.calls.count((0, 10)) == 1
+        rr.run_main(args, pool)                         # crashes on the first task 10..19
+    rr.run_main(args, pool)                             # resumes
+    # the chunks holding frames 0 and F-1 (band rows) come first, for every satellite
+    assert sorted(pool.calls[:6]) == sorted((s, a, b) for s in (0, 1, 2) for a, b in ((0, 10), (20, 25)))
+    assert pool.calls.count((0, 10, 20)) == 2 and pool.calls.count((0, 0, 10)) == 1
     raw = tmp_path / 'run' / 'raw'
     bands = json.loads((raw / 'bands.json').read_text())
     rows = np.array(bands['rows'])
@@ -93,15 +125,18 @@ def test_render_to_raw_with_resume(tmp_path):
         assert left == []
         refs = sorted(p.name for p in (tmp_path / 'run' / 'reference_frames' / f'satellite_{s:02d}').glob('*.png'))
         assert refs == ['frame_0000.png', 'frame_0010.png', 'frame_0020.png', 'frame_0024.png']
-    assert json.loads((raw / 'progress.json').read_text())['frames'] == list(range(F))
-    n = len(render.calls)
-    rr.run_main(args, render)                           # nothing left to do
-    assert len(render.calls) == n
+    progress = json.loads((raw / 'progress.json').read_text())
+    assert progress['frames'] == list(range(F)) and progress['done']['2'] == list(range(F))
+    poses = [json.loads(l)['frame'] for l in (args.output / 'satellite_01' / 'poses.jsonl').read_text().splitlines()]
+    assert poses == list(range(F))
+    n = len(pool.calls)
+    rr.run_main(args, pool)                             # nothing left to do
+    assert len(pool.calls) == n
 
 
 def test_keep_frames(tmp_path):
     args = make_args(tmp_path, keep_frames=True)
-    rr.run_main(args, FakeRender())
+    rr.run_main(args, FakePool())
     raw = tmp_path / 'run' / 'raw'
     rows = np.array(json.loads((raw / 'bands.json').read_text())['rows'])
     for s in (0, 1, 2):
