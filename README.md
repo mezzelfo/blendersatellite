@@ -276,12 +276,14 @@ Nothing is specific to one machine: devices are found and identified at start.
   where the probe cannot identify a device, `--max-workers-per-gpu` (`MAX_WORKERS_PER_GPU`,
   default 4), `--workers-per-gpu N` (`WORKERS_PER_GPU`, fixed number, no measuring),
   `--chunk` (`RENDER_CHUNK`, default 20 frames), `--gpu-memory-margin` (MiB, default 1024),
-  `--ram-margin` (MiB, default 4096), `--workers` (extraction processes, default the cores not
+  `--ram-margin` (MiB, default 4096), `--min-worker-gain` (`MIN_WORKER_GAIN`, default 0.10:
+  the frame-rate gain an added worker must bring), `--workers` (extraction processes, default the cores not
   taken by render workers).
 - **Queue** (`renders/queue/`): `pending/`, `claimed/` (a worker claims a task by an atomic
   rename), `done/` (marker with the task's poses and timings), `extracted/` (raw mode: written
   after the rows are verified, before the PNGs are deleted), `workers/` (status), `logs/`
-  (one Blender log per worker), `events.jsonl` (worker start/exit, sizing decisions,
+  (one Blender log per worker), `stop/` (the driver's request to a worker to exit after its
+  current task), `events.jsonl` (worker start/exit, sizing decisions,
   extraction timings), `config.json` (chunk and selection; a resume must use the same). Each
   worker (`render_swarm.py --task-queue`) loads the scene once (about 65 s) and claims tasks
   until none is left, so faster GPUs take more tasks. A dead worker's task goes back to
@@ -295,8 +297,20 @@ Nothing is specific to one machine: devices are found and identified at start.
   that GPU while (free memory - margin) > memory per worker, up to `--max-workers-per-gpu`,
   the CPU count and the host memory. The free memory is the smaller of the current reading
   and (free before the first worker - workers x peak), because an EEVEE worker's memory swings
-  within every render (2.5 to 7.2 GiB with walls). Each decision goes to the log (pipeline.log)
-  and `events.jsonl`. With walls on a 12 GiB TITAN Xp this gives one worker per GPU.
+  within every render (2.5 to 7.2 GiB with walls). Memory is necessary but not enough: an
+  added worker is on trial. Once it has finished its first task and every older worker of
+  that GPU has finished a task claimed after the new worker's first claim, the driver compares
+  the GPU's frame rate (the sum over its workers of frames / render time of their last 3
+  tasks; a task's time runs from claim to done marker, so setup never counts) with the rate
+  just before the worker was added. That rate leaves out each worker's first task (about 6%
+  slower, first-frame warm-up), so a worker is added only after the previous one has finished
+  its second task. If the rate rose by at least `--min-worker-gain` (default
+  0.10, +10%) the worker stays and the memory check may add the next one; otherwise the driver
+  writes `queue/stop/WORKER`, the worker exits after the task it is rendering (in practice its
+  second), and the count of that GPU is final. `--workers-per-gpu N` skips both checks. Each
+  decision goes to the log (pipeline.log) and `events.jsonl`, with the rates before and after
+  (total and per worker). With walls on a 12 GiB TITAN Xp memory allows one worker per GPU;
+  with the GRID scene (4.6 GiB per worker) two, and the second raises the rate by about 70%.
 - **Results do not depend on the hardware**: the same PNGs and raw files bit for bit whatever
   the number of GPUs and workers (checked in step 24). For this `render_swarm.py` no longer
   writes the render date and render time into the PNG metadata (Blender's default text chunks

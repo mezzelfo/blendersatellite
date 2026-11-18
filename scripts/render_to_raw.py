@@ -241,7 +241,8 @@ def real_pool(args, queue, n_tasks):
     command = rp.worker_command(args.blender, args.cameras.resolve(), args.terrain.resolve(), args.output.resolve(),
                                 queue, args.render_args)
     return rp.WorkerPool(queue, devices, command, args.workers_per_gpu, args.max_workers_per_gpu,
-                         args.gpu_memory_margin, args.ram_margin, output=args.output)
+                         args.gpu_memory_margin, args.ram_margin, output=args.output,
+                         min_gain=args.min_worker_gain)
 
 
 def run_main(args, make_pool=real_pool):

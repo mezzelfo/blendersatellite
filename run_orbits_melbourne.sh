@@ -20,6 +20,7 @@ MELBOURNE_BLENDER_BIN="${BLENDER_BIN:-/snap/blender/current/blender}"
 # Rendering hardware (scripts/render_pool.py, both render modes): GPUS=all or a list of GPUs
 # (nvidia-smi index or UUID), MAX_WORKERS_PER_GPU (default 4) caps the Blender workers per GPU,
 # whose number is otherwise chosen from the measured GPU memory; WORKERS_PER_GPU=N fixes it;
+# MIN_WORKER_GAIN (default 0.10) the frame-rate gain an added worker must bring to be kept;
 # DEVICE_MAP=GPU=BLENDER_DEVICE,... overrides the device probe; RENDER_CHUNK frames per task.
 GPUS="${GPUS:-all}"
 MAX_WORKERS_PER_GPU="${MAX_WORKERS_PER_GPU:-4}"

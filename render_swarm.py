@@ -458,6 +458,7 @@ def run_worker(args,render_frames,counts,worst,setup_start,eevee):
       claimed/NAME@WORKER.json      claimed by an atomic rename from pending/ (one winner)
       done/NAME.json                done marker: poses of every frame of the task, timings, worker
       workers/WORKER.json           status: pid, state, setup time, GPU memory, tasks done
+      stop/WORKER                   written by the driver: finish the current task, claim no other
     A worker that finds no pending task waits while other workers still hold claimed tasks
     (the driver puts a dead worker's task back in pending/), and exits when none is left.
     """
@@ -473,8 +474,13 @@ def run_worker(args,render_frames,counts,worst,setup_start,eevee):
     def driver_alive():
         return not args.parent_pid or os.getppid()==args.parent_pid
 
+    stop_path=queue/'stop'/args.worker_id  # written by the driver when this worker adds no throughput
+
     def claim():
         while driver_alive():
+            if stop_path.exists():
+                print(f'Worker {args.worker_id}: stopped by the driver ({stop_path.read_text().strip()})',flush=True)
+                return None
             for name in sorted(os.listdir(pending)):
                 if not name.endswith('.json'):continue
                 target=claimed/f'{name[:-5]}@{args.worker_id}.json'

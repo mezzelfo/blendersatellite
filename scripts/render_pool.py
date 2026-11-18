@@ -28,8 +28,13 @@ Workers per GPU
     One worker per GPU first. After its first task the driver reads the worker's GPU memory
     (nvidia-smi per process, else the drop of the GPU's free memory) and starts another worker on
     that GPU while free memory - margin > memory per worker, up to --max-workers-per-gpu, the CPU
-    count and the host memory (MemAvailable - margin > worker RSS). --workers-per-gpu N fixes the
-    number. Every decision is logged (and written to QUEUE/events.jsonl).
+    count and the host memory (MemAvailable - margin > worker RSS). An added worker is on trial:
+    after its first task the GPU's frame rate (frames / render time of the last 3 tasks of each
+    worker, claimed after the new worker's first claim; setup excluded) is compared with the rate
+    before it was added. If it rose by less than --min-worker-gain (default 0.10) the driver
+    writes QUEUE/stop/WORKER (the worker finishes its current task and exits) and freezes the
+    count; else the worker stays and the next one may be tried. --workers-per-gpu N fixes the
+    number. Every decision is logged with its rates (and written to QUEUE/events.jsonl).
 
 Frames mode (this file as a command): render every frame as PNG with the pool, e.g.
     python scripts/render_pool.py --cameras RUN/simulation/cameras.json --terrain RUN/terrain_render \\
@@ -317,7 +322,7 @@ class TaskQueue:
 
     def __init__(self, root):
         self.root = Path(root).resolve()
-        for sub in ('pending', 'claimed', 'done', 'workers', 'logs'):
+        for sub in ('pending', 'claimed', 'done', 'workers', 'logs', 'stop'):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
         self.pending, self.claimed, self.done = self.root / 'pending', self.root / 'claimed', self.root / 'done'
 
@@ -425,7 +430,7 @@ class PoolFailed(RuntimeError):
 
 class WorkerPool:
     def __init__(self, queue, devices, command, workers_per_gpu=None, max_workers_per_gpu=4,
-                 gpu_margin_mib=1024, ram_margin_mib=4096, max_workers=None, output=None):
+                 gpu_margin_mib=1024, ram_margin_mib=4096, max_workers=None, output=None, min_gain=0.10):
         self.queue, self.devices, self.command, self.output = queue, devices, command, output
         self.fixed, self.max_per_gpu = workers_per_gpu, max_workers_per_gpu
         self.gpu_margin, self.ram_margin = gpu_margin_mib, ram_margin_mib
@@ -437,6 +442,9 @@ class WorkerPool:
                                 if (m := re.match(r's(\d+)-', p.stem))], default=0)
         self.decisions = []
         self.peak = {}              # pid -> highest per-process GPU MiB sampled by the driver
+        self.min_gain = min_gain    # relative frame-rate gain an added worker must bring
+        self.trial = {}             # device label -> dict(wid, before, details) of the worker on trial
+        self.tasks = {}             # done marker name -> (worker, claimed_at, finished_at, frames rendered)
 
     def alive(self, device=None):
         return [w for w in self.workers if w['alive'] and (device is None or w['device'] is device)]
@@ -483,6 +491,42 @@ class WorkerPool:
         self.queue.event('sizing', gpu=device['label'], workers=len(self.alive(device)), decision=text, **data)
         log(msg)
 
+    RATE_WINDOW = 3                 # recent tasks per worker in a frame-rate estimate
+
+    def read_tasks(self):
+        """Cache (worker, claimed_at, finished_at, rendered) of every new done marker."""
+        for p in self.queue.done.glob('*.json'):
+            if p.stem not in self.tasks:
+                try:
+                    m = json.loads(p.read_text())
+                    self.tasks[p.stem] = (m['worker_id'], m['claimed_at'], m['finished_at'], m['rendered'])
+                except (OSError, ValueError, KeyError):
+                    continue                                           # being written: next poll
+
+    def gpu_rate(self, device, since=None):
+        """Combined frame rate of `device`: the sum over its workers of frames / render time of their
+        last RATE_WINDOW tasks (claimed at or after `since`); setup is never included, since a task's
+        time runs from its claim to its done marker. Without `since` (the rate before adding a worker)
+        each worker's first rendered task is left out too: it is ~6% slower (first-frame warm-up) and
+        would inflate the gain of the next worker. None while a worker of the device has no such
+        task (or nothing was rendered, e.g. every frame already existed)."""
+        self.read_tasks()
+        total, per = 0.0, {}
+        for w in self.workers:
+            if w['device'] is not device or (not w['alive'] and since is None):
+                continue
+            mine = sorted((t for t in self.tasks.values() if t[0] == w['wid'] and t[3] > 0
+                           and (since is None or t[1] >= since)), key=lambda t: t[1])
+            mine = (mine if since is not None else mine[1:])[-self.RATE_WINDOW:]
+            if not mine:
+                if w['alive']:
+                    return None, per
+                continue
+            rate = sum(t[3] for t in mine) / max(sum(t[2] - t[1] for t in mine), 1e-9)
+            per[w['wid']] = round(rate, 4)
+            total += rate
+        return (total or None), per
+
     def status(self, w):
         try:
             return json.loads((self.queue.root / 'workers' / f"{w['wid']}.json").read_text())
@@ -498,6 +542,29 @@ class WorkerPool:
         newest = statuses[-1]
         if newest.get('gpu_mib_after_first_task') is None and newest.get('state') != 'finished':
             return                                                     # wait for its first task
+        trial = self.trial.get(device['label'])
+        if trial and trial['wid'] == mine[-1]['wid'] and 'after' not in trial \
+                and self.queue.counts()['pending'] > 0:
+            # The newest worker is on trial: compare the GPU's frame rate over tasks claimed after
+            # the trial worker's first claim (all workers rendering together) with the rate before.
+            self.read_tasks()
+            first = min((t[1] for t in self.tasks.values() if t[0] == trial['wid']), default=None)
+            after, per = self.gpu_rate(device, since=first) if first is not None else (None, {})
+            if after is None:
+                return                             # an older worker has no task in that window yet
+            gain = after / trial['before'] - 1
+            trial.update(after=after, after_per_worker=per, gain=gain)
+            rates = (f"{len(mine) - 1} -> {len(mine)} workers: {trial['before']:.3f} -> {after:.3f} frames/s "
+                     f"({gain:+.0%}, needed +{self.min_gain:.0%})")
+            data = dict(rate_before=trial['before'], rate_before_per_worker=trial['before_per_worker'],
+                        rate_after=after, rate_after_per_worker=per, gain=gain, min_gain=self.min_gain)
+            if gain < self.min_gain:
+                (self.queue.root / 'stop' / trial['wid']).write_text(f'gain {gain:+.1%} < +{self.min_gain:.0%}\n')
+                self.decide(device, f"final: {rates}: worker {trial['wid']} stops after its current task",
+                            workers_kept=len(mine) - 1, **data)
+                return
+            log(f"GPU {device['label']}: {rates}: worker {trial['wid']} kept")
+            self.queue.event('sizing', gpu=device['label'], workers=len(mine), decision='keep', **data)
         uuids = {s.get('gpu_uuid') for s in statuses if s.get('gpu_uuid')}
         if device.get('uuid') and uuids - {device['uuid']}:
             raise PoolFailed(f"worker on GPU {device['label']} runs on {uuids}, expected {device['uuid']}: "
@@ -534,9 +601,18 @@ class WorkerPool:
             self.decide(device, f'final: host memory {avail} MiB available, {rss} MiB RSS per worker, '
                                 f'margin {self.ram_margin}: no room for another worker', **data)
         else:
-            log(f"GPU {device['label']}: {txt}, host {avail} MiB available / {rss} MiB RSS: adding a worker")
-            self.queue.event('sizing', gpu=device['label'], workers=len(mine) + 1, decision='add', **data)
+            before, per_worker = self.gpu_rate(device)
+            if before is None and any(t[0] in {w['wid'] for w in mine} and t[3] > 0 for t in self.tasks.values()):
+                return       # wait for a second rendered task of every worker of this GPU (rate before)
+            rate_txt = f', {before:.3f} frames/s with {len(mine)}' if before else ''
+            log(f"GPU {device['label']}: {txt}, host {avail} MiB available / {rss} MiB RSS{rate_txt}: "
+                f"adding a worker")
+            self.queue.event('sizing', gpu=device['label'], workers=len(mine) + 1, decision='add',
+                             rate_before=before, rate_before_per_worker=per_worker, **data)
             self.launch(device)
+            if before:   # on trial until its first task (no rate before, e.g. on a resume: memory only)
+                self.trial[device['label']] = dict(wid=self.workers[-1]['wid'], before=before,
+                                                   before_per_worker=per_worker)
 
     def poll(self):
         """Reap dead workers (requeue their tasks), grow the pool; returns the number alive."""
@@ -708,6 +784,8 @@ def add_pool_arguments(ap):
     ap.add_argument('--max-workers-per-gpu', type=int, default=4)
     ap.add_argument('--gpu-memory-margin', type=int, default=1024, help='MiB kept free on each GPU')
     ap.add_argument('--ram-margin', type=int, default=4096, help='MiB of host memory kept free')
+    ap.add_argument('--min-worker-gain', type=float, default=float(os.environ.get('MIN_WORKER_GAIN', 0.10)),
+                    help='an added worker is kept only if the GPU frame rate rose by this fraction (default 0.10)')
     ap.add_argument('--chunk', type=int, default=20, help='frames per task (one satellite)')
     ap.add_argument('--queue', type=Path, default=None, help='queue directory (default OUTPUT/queue)')
 
@@ -746,7 +824,8 @@ def build_pool(args, render_args, output, n_tasks):
         f'devices: {describe(devices)}')
     mode = (f'--workers-per-gpu {args.workers_per_gpu}' if args.workers_per_gpu else
             f'automatic from measured memory (max {args.max_workers_per_gpu} per GPU, GPU margin '
-            f'{args.gpu_memory_margin} MiB, host margin {args.ram_margin} MiB)')
+            f'{args.gpu_memory_margin} MiB, host margin {args.ram_margin} MiB), an added worker kept '
+            f'only if the GPU frame rate rises by {args.min_worker_gain:.0%}')
     log(f'Workers per GPU: {mode}; {n_tasks} task(s) of up to {args.chunk} frames')
     return devices
 
@@ -796,7 +875,7 @@ def main():
     pool = WorkerPool(queue, devices, worker_command(args.blender, args.cameras, args.terrain, args.output, queue,
                                                      render_args),
                       args.workers_per_gpu, args.max_workers_per_gpu, args.gpu_memory_margin, args.ram_margin,
-                      output=args.output)
+                      output=args.output, min_gain=args.min_worker_gain)
     t0 = time.time()
     try:
         drive(queue, pool, total=len(tasks))
