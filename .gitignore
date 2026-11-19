@@ -41,3 +41,7 @@ OBJ/
 !output/orbits_melbourne/20261117T152130Z_run_Vs0yvl/band_samples/**
 !output/orbits_melbourne/20261117T152130Z_run_Vs0yvl/report_25/
 !output/orbits_melbourne/20261117T152130Z_run_Vs0yvl/report_25/**
+# step 25: band samples of the cubes of the 20 deg async run
+!output/orbits_melbourne/20261118T164126Z_run_lxrAFk/
+!output/orbits_melbourne/20261118T164126Z_run_lxrAFk/band_samples/
+!output/orbits_melbourne/20261118T164126Z_run_lxrAFk/band_samples/**
