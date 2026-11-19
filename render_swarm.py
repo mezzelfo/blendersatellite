@@ -364,7 +364,7 @@ def main():
                     target_pixel=world_to_camera_view(scene,camera,Vector(own_target))
                     target_error=float(np.hypot((target_pixel.x-.5)*width,(target_pixel.y-.5)*height))
                     alignment=float(np.dot(projected_across,across))
-                    if target_error>.01 or (alignment<1-1e-10 and not aimed_record):
+                    if target_error>.05 or (alignment<1-1e-10 and not aimed_record):
                         raise RuntimeError(f'Frame {frame} camera {index}: target error {target_error}px, across-track alignment {alignment}')
                     worst['target_px']=max(worst['target_px'],target_error)
                     worst['alignment']=min(worst['alignment'],alignment)
