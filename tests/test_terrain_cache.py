@@ -478,3 +478,32 @@ def test_cache_refuses_mixed_tiles(walls_built):
     for extra in ([], ['--no-facades', '--tag', 'grid']):
         result = subprocess.run(list(map(str, base + extra + ['--dry-run'])), cwd=ROOT, capture_output=True, text=True)
         assert result.returncode == 0, (extra, result.stderr[-500:])
+
+
+def test_download_error_is_picklable(tmp_path, monkeypatch):
+    """A failed download reaches the main process as a readable error (worker exceptions are pickled)."""
+    import pickle
+    import urllib.error
+    import terrain_cache as tc
+
+    url = 'https://example.invalid/TILE.zip'
+    body = tmp_path / 'body'
+    body.write_bytes(b'')
+
+    def http_error():
+        # a real response body is a BufferedReader, which cannot be pickled
+        return urllib.error.HTTPError(url, 403, 'Forbidden', {}, body.open('rb'))
+
+    with pytest.raises(TypeError, match='pickle'):
+        pickle.dumps(http_error())
+
+    def refuse(*args, **kwargs):
+        raise http_error()
+
+    monkeypatch.setattr(tc.urllib.request, 'urlopen', refuse)
+    monkeypatch.setattr(tc.time, 'sleep', lambda seconds: None)
+    with pytest.raises(RuntimeError) as caught:
+        tc.download(url, tmp_path / 'TILE.zip')
+    restored = pickle.loads(pickle.dumps(caught.value))
+    assert 'HTTP Error 403: Forbidden' in str(restored) and url in str(restored)
+    assert not (tmp_path / 'TILE.zip.part').exists()

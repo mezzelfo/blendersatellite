@@ -75,7 +75,12 @@ def load_datasets(path=REPO/'terrain_datasets.json'):
 # ----------------------------------------------------------------------------- download
 
 def download(url, destination, retries=3, chunk=1 << 20):
-    """Stream url to destination atomically; return the number of bytes written."""
+    """Stream url to destination atomically; return the number of bytes written.
+
+    After the last failed attempt raises RuntimeError with the URL and the original error as
+    text. The original exception is not re-raised because it may not be picklable (an
+    urllib HTTPError holds the open response), and process_tile runs in worker processes
+    whose exceptions are pickled back to the main process."""
     temporary = destination.with_suffix(destination.suffix + '.part')
     for attempt in range(1, retries + 1):
         try:
@@ -83,10 +88,11 @@ def download(url, destination, retries=3, chunk=1 << 20):
                 shutil.copyfileobj(response, out, chunk)
             temporary.replace(destination)
             return destination.stat().st_size
-        except Exception:
+        except Exception as error:
             temporary.unlink(missing_ok=True)
             if attempt == retries:
-                raise
+                raise RuntimeError(f'download failed after {retries} attempts: {url}: '
+                                   f'{type(error).__name__}: {error}') from error
             time.sleep(5 * attempt)
 
 
