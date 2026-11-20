@@ -1,0 +1,530 @@
+"""Convert native-CRS terrain caches (terrain_cache.py) into render_swarm.py inputs.
+
+For every tile in cameras.json 'selected_tiles' the native grid is binned to the
+render spacing (area mean of the cache cells overlapping each render cell,
+weighted by overlap area and coverage), empty cells are filled from the nearest
+filled cell, and the cell centres are transformed into the simulation's local
+ENU frame with the same chain as prepare_swarm_terrain.py:
+projected CRS -> geographic CRS -> ECEF (height used as ellipsoidal) -> local.
+
+The output files have the keys render_swarm.py expects (vertices, rgb, shape,
+sampled_fraction) plus the cache_frame.json guard, so a run can switch to them
+with --terrain <output> and no change to the renderer.
+
+  python pipeline/terrain_to_render.py --cameras .../simulation/cameras.json \\
+      --cache data/terrain/melbourne_2020/1m --dataset melbourne_2020
+  (output by default in <run>/terrain_render)
+
+--walls (needs the facade voxels, which terrain_cache.py stores unless --no-facades) adds
+vertical walls: on the render grid, every shared edge between 4-adjacent cells whose heights
+differ by more than --wall-threshold (2 m) gets a wall from the lower to the upper height,
+split into segments of height <= the render spacing and coloured from the facade voxels (see build_walls and colour_segments). The
+neighbouring tiles' grids and voxels are loaded as a one-cell halo, and a seam edge belongs to
+the tile holding its west or south cell. Extra keys in the render .npz (grid keys unchanged):
+  wall_vertices  float32 (4 S, 3), local frame, 4 corners per segment
+                 (bottom a, bottom b, top b, top a; render_swarm.py adds two triangles each)
+  wall_rgb       uint8 (4 S, 3), sRGB, the segment colour repeated on its 4 corners
+  wall_segments, wall_edges, wall_sources, wall_source_counts (segments coloured from voxels,
+                 from the nearest voxel, from the lower cell)
+Renders with and without walls must not be mixed: cache_frame.json records the wall settings,
+so --walls refuses an output folder made without them and the reverse.
+"""
+import argparse
+import json
+from functools import lru_cache
+from pathlib import Path
+
+import numpy as np
+from pyproj import Transformer
+from scipy.ndimage import distance_transform_edt
+
+from terrain_cache import load_datasets, run_tiles
+
+
+def _axis_overlap(start, spacing, count, target):
+    """Split cells [start + i*spacing, +spacing) between the target bins they overlap.
+
+    Returns the grid origin (multiple of target), and for every source cell the lower bin
+    index and the fraction of the cell inside it (the rest goes to the next bin).
+    Requires spacing <= target, so a cell overlaps at most two bins.
+    """
+    origin = np.floor(start / target) * target
+    left = (start - origin) / target + np.arange(count) * (spacing / target)  # in bins
+    low = np.floor(left + 1e-9).astype(np.int64)
+    fraction = np.clip((low + 1 - left) * (target / spacing), 0., 1.)
+    fraction[fraction > 1 - 1e-9] = 1.  # cell entirely inside one bin
+    return origin, low, fraction
+
+
+def bin_to_spacing(height, rgb, coverage, x0, y0, spacing, target, return_weight=False):
+    """Area-mean of a native grid into a grid of cell size target aligned to multiples of target.
+
+    Each native cell contributes to every target cell it overlaps, weighted by the
+    overlap area times its coverage, so the binned value is centred on the target
+    cell even when target / spacing is not an integer (e.g. 1 m -> 2.5 m).
+    With return_weight, also returns the summed weight per target cell (covered native
+    area in sub-cell units), used to decide which tile owns a cell shared by two tiles.
+    """
+    if spacing > target + 1e-9:
+        raise ValueError(f'cache spacing {spacing} is coarser than the render spacing {target}')
+    rows, cols = height.shape
+    gx0, ci, fx = _axis_overlap(x0, spacing, cols, target)
+    gy0, ri, fy = _axis_overlap(y0, spacing, rows, target)
+    out_cols = int(np.max(np.where(fx < 1, ci + 1, ci))) + 1
+    out_rows = int(np.max(np.where(fy < 1, ri + 1, ri))) + 1
+    n = out_rows * out_cols
+    base = np.where(np.isfinite(height), coverage, 0).astype(np.float64)
+    hval = np.nan_to_num(height).astype(np.float64)
+    wsum, hsum, csum = np.zeros(n), np.zeros(n), np.zeros((n, 3))
+    for dr, wy in ((0, fy), (1, 1 - fy)):
+        for dc, wx in ((0, fx), (1, 1 - fx)):
+            weight = (base * wy[:, None] * wx[None, :]).ravel()
+            used = weight > 0
+            key = ((ri + dr)[:, None] * out_cols + (ci + dc)[None, :]).ravel()[used]
+            weight = weight[used]
+            wsum += np.bincount(key, weight, n)
+            hsum += np.bincount(key, weight * hval.ravel()[used], n)
+            for k in range(3):
+                csum[:, k] += np.bincount(key, weight * rgb[..., k].ravel()[used], n)
+    valid = wsum > 0
+    with np.errstate(invalid='ignore', divide='ignore'):
+        h = np.where(valid, hsum / wsum, np.nan).reshape(out_rows, out_cols)
+        c = np.where(valid[:, None], csum / wsum[:, None], 0).reshape(out_rows, out_cols, 3)
+    if return_weight:
+        return h, np.rint(c).astype(np.uint8), gx0, gy0, wsum.reshape(out_rows, out_cols)
+    return h, np.rint(c).astype(np.uint8), gx0, gy0
+
+
+# ----------------------------------------------------------------------------- render grid
+
+def render_grid(cache_path, target):
+    """Render grid of one cached tile in its native CRS: binned to target, empty cells filled
+    from the nearest filled cell. Returns height, rgb, weight (binned coverage, 0 on filled
+    cells), x0, y0, global cell indices i0 = x0 / target, j0 = y0 / target, sampled_fraction."""
+    with np.load(cache_path) as data:
+        h, rgb, x0, y0, weight = bin_to_spacing(data['height'], data['rgb'], data['coverage'],
+                                                float(data['x0']), float(data['y0']), float(data['spacing']),
+                                                target, return_weight=True)
+    valid = np.isfinite(h)
+    if not valid.any():
+        raise ValueError(f'No covered cells in {cache_path}')
+    nearest = distance_transform_edt(~valid, return_distances=False, return_indices=True)
+    h = h[tuple(nearest)]
+    rgb = rgb[tuple(nearest)]
+    return dict(height=h, rgb=rgb, weight=np.where(valid, weight, 0.), x0=x0, y0=y0,
+                i0=int(round(x0 / target)), j0=int(round(y0 / target)), sampled_fraction=float(valid.mean()))
+
+
+def to_local(xyz, manifest, dataset):
+    """Native projected CRS (x, y, height) -> geographic -> ECEF -> the run's local frame."""
+    geo = Transformer.from_crs(dataset['projected_epsg'], dataset['geographic_epsg'], always_xy=True)
+    ecef = Transformer.from_crs(4979, 4978, always_xy=True)
+    lon, lat = geo.transform(xyz[:, 0], xyz[:, 1])
+    earth = np.array(ecef.transform(lon, lat, xyz[:, 2])).T
+    return (earth - np.asarray(manifest['origin_ecef_m'])) @ np.asarray(manifest['local_from_ecef']).T
+
+
+# ----------------------------------------------------------------------------- walls
+
+WALL_MAX_ANGLE_DEG = 60.       # voxel normal vs wall outward normal
+WALL_FALLBACK_CELLS = 2.       # nearest-voxel fallback radius, in render cells
+SOURCES = ('voxels', 'nearest_voxel', 'lower_cell', 'lower_cell_small_step')
+MAX_CANDIDATES_WALL = 4_000_000
+
+
+def merged_window(tile, grids, pad=1):
+    """Heights, colours and owners on the tile's render grid padded by pad cells (the halo).
+
+    grids: {tile: render_grid(...)} for every tile available (the tile and its neighbours).
+    Tiles of a dataset share one global lattice of render cells, but neighbouring tiles can
+    both hold a cell along their seam (each with its own part of the cell). Such a cell is
+    owned by the tile with the largest binned coverage weight, ties going to the first tile
+    name in sorted order; the owner's height and colour are used. The rule depends only on
+    the tiles holding the cell, so every tile reaches the same decision.
+    Returns names (sorted tiles overlapping the window), owner (index into names, -1 = no
+    cell), height, rgb, and the global indices (i0, j0) of window cell [0, 0].
+    """
+    g = grids[tile]
+    rows, cols = g['height'].shape
+    i0, j0 = g['i0'] - pad, g['j0'] - pad
+    n_rows, n_cols = rows + 2 * pad, cols + 2 * pad
+    names = sorted(t for t, n in grids.items()
+                   if n['i0'] < i0 + n_cols and n['i0'] + n['height'].shape[1] > i0
+                   and n['j0'] < j0 + n_rows and n['j0'] + n['height'].shape[0] > j0)
+    owner = np.full((n_rows, n_cols), -1)
+    weight = np.full((n_rows, n_cols), -1.)
+    height = np.full((n_rows, n_cols), np.nan)
+    rgb = np.zeros((n_rows, n_cols, 3), dtype=np.uint8)
+    for k, name in enumerate(names):
+        n = grids[name]
+        nr, nc = n['height'].shape
+        c0, c1 = max(i0, n['i0']), min(i0 + n_cols, n['i0'] + nc)
+        r0, r1 = max(j0, n['j0']), min(j0 + n_rows, n['j0'] + nr)
+        win = (slice(r0 - j0, r1 - j0), slice(c0 - i0, c1 - i0))
+        src = (slice(r0 - n['j0'], r1 - n['j0']), slice(c0 - n['i0'], c1 - n['i0']))
+        better = n['weight'][src] > weight[win]
+        weight[win] = np.where(better, n['weight'][src], weight[win])
+        owner[win] = np.where(better, k, owner[win])
+        height[win] = np.where(better, n['height'][src], height[win])
+        rgb[win] = np.where(better[..., None], n['rgb'][src], rgb[win])
+    return names, owner, height, rgb, i0, j0
+
+
+def merge_voxels(parts):
+    """Merge facade voxel sets of several tiles: one entry per (ix, iy, iz), count-weighted.
+    parts: list of dicts with ijk (N,3) int, rgb (N,3), normal (N,2) (x 127), count (N,)."""
+    parts = [p for p in parts if len(p['ijk'])]
+    if not parts:
+        return dict(ijk=np.zeros((0, 3), np.int64), rgb=np.zeros((0, 3)), normal=np.zeros((0, 2)),
+                    count=np.zeros(0))
+    ijk = np.concatenate([p['ijk'] for p in parts]).astype(np.int64)
+    count = np.concatenate([p['count'] for p in parts]).astype(np.float64)
+    rgb = np.concatenate([p['rgb'] for p in parts]).astype(np.float64)
+    normal = np.concatenate([p['normal'] for p in parts]).astype(np.float64) / 127
+    unique, inverse = np.unique(ijk, axis=0, return_inverse=True)
+    inverse = inverse.ravel()
+    total = np.bincount(inverse, count, len(unique))
+
+    def mean(values):
+        return np.stack([np.bincount(inverse, values[:, c] * count, len(unique)) for c in range(values.shape[1])],
+                        1) / total[:, None]
+    return dict(ijk=unique, rgb=mean(rgb), normal=mean(normal), count=total)
+
+
+def _enumerate_boxes(lo, hi, voxel, chunk=MAX_CANDIDATES_WALL):
+    """Voxels whose centre lies in the boxes [lo, hi] (S,3); yields (segment ids, ijk) in chunks."""
+    a = np.ceil(lo / voxel - .5).astype(np.int64)
+    b = np.floor(hi / voxel - .5).astype(np.int64)
+    size = np.maximum(b - a + 1, 0)
+    counts = size.prod(1)
+    ends = np.cumsum(counts)
+    start = 0
+    while start < len(counts):
+        stop = max(int(np.searchsorted(ends, (ends[start - 1] if start else 0) + chunk, 'right')), start + 1)
+        sl = slice(start, stop)
+        total = int(counts[sl].sum())
+        if total:
+            sid = np.repeat(np.arange(start, stop), counts[sl])
+            offset = np.arange(total) - np.repeat(np.cumsum(counts[sl]) - counts[sl], counts[sl])
+            sx, sy = size[sid, 0], size[sid, 1]
+            ijk = a[sid] + np.stack([offset % sx, (offset // sx) % sy, offset // (sx * sy)], 1)
+            yield sid, ijk
+        start = stop
+
+
+def _rect_distance(centre, xa, xb, ya, yb, z0, z1):
+    """Horizontal and vertical distances from points (n,3) to axis-aligned wall rectangles."""
+    dx = np.maximum(0, np.maximum(xa - centre[:, 0], centre[:, 0] - xb))
+    dy = np.maximum(0, np.maximum(ya - centre[:, 1], centre[:, 1] - yb))
+    dz = np.maximum(0, np.maximum(z0 - centre[:, 2], centre[:, 2] - z1))
+    return np.hypot(dx, dy), dz
+
+
+def colour_segments(seg, voxels, voxel_size, spacing, max_angle_deg=WALL_MAX_ANGLE_DEG,
+                    fallback_cells=WALL_FALLBACK_CELLS):
+    """Colour wall segments from facade voxels.
+
+    seg: dict of (S,) arrays xa, xb, ya, yb (horizontal extent of the segment, degenerate in the
+    axis normal to it), z0, z1, nx, ny (outward normal, unit, axis-aligned).
+    A voxel is compatible with a segment if its mean normal is within max_angle_deg of the
+    segment's outward normal. Colour = count-weighted mean of the compatible voxels whose centre
+    is within spacing / 2 of the segment's edge line horizontally and inside [z0, z1]; else the
+    nearest compatible voxel (3D distance from its centre to the segment) within fallback_cells
+    render cells; else none. Returns rgb (S,3) float (NaN where none) and source (S,) int8:
+    0 = voxels, 1 = nearest voxel, 2 = none.
+    """
+    n_seg = len(seg['z0'])
+    rgb = np.full((n_seg, 3), np.nan)
+    source = np.full(n_seg, 2, dtype=np.int8)
+    if not n_seg or not len(voxels['ijk']):
+        return rgb, source
+    ijk = voxels['ijk']
+    base = ijk.min(0) - 1
+    dims = ijk.max(0) - base + 2
+    keys = ((ijk[:, 2] - base[2]) * dims[1] + (ijk[:, 1] - base[1])) * dims[0] + (ijk[:, 0] - base[0])
+    order = np.argsort(keys)
+    sorted_keys = keys[order]
+    length = np.linalg.norm(voxels['normal'], axis=1)
+    unit = voxels['normal'] / np.where(length > 0, length, 1)[:, None]
+    cos_max = np.cos(np.radians(max_angle_deg))
+
+    def lookup(sid, cand):
+        inside = ((cand > base) & (cand < base + dims - 1)).all(1)
+        sid, cand = sid[inside], cand[inside]
+        k = ((cand[:, 2] - base[2]) * dims[1] + (cand[:, 1] - base[1])) * dims[0] + (cand[:, 0] - base[0])
+        pos = np.minimum(np.searchsorted(sorted_keys, k), len(sorted_keys) - 1)
+        hit = sorted_keys[pos] == k
+        vid = order[pos[hit]]
+        sid = sid[hit]
+        ok = (length[vid] > 0) & (unit[vid, 0] * seg['nx'][sid] + unit[vid, 1] * seg['ny'][sid] >= cos_max - 1e-12)
+        return sid[ok], vid[ok]
+
+    xa, xb, ya, yb, z0, z1 = (seg[k] for k in ('xa', 'xb', 'ya', 'yb', 'z0', 'z1'))
+    half = spacing / 2
+    # Direct: centre within spacing / 2 of the edge line horizontally, inside the height range.
+    lo = np.c_[xa - half, ya - half, z0]
+    hi = np.c_[xb + half, yb + half, z1]
+    wsum = np.zeros(n_seg)
+    csum = np.zeros((n_seg, 3))
+    for sid, cand in _enumerate_boxes(lo, hi, voxel_size):
+        sid, vid = lookup(sid, cand)
+        centre = (ijk[vid] + .5) * voxel_size
+        hd, dz = _rect_distance(centre, xa[sid], xb[sid], ya[sid], yb[sid], z0[sid], z1[sid])
+        ok = (hd <= half + 1e-9) & (dz <= 1e-9)
+        sid, vid = sid[ok], vid[ok]
+        w = voxels['count'][vid]
+        wsum += np.bincount(sid, w, n_seg)
+        for c in range(3):
+            csum[:, c] += np.bincount(sid, w * voxels['rgb'][vid, c], n_seg)
+    direct = wsum > 0
+    rgb[direct] = csum[direct] / wsum[direct, None]
+    source[direct] = 0
+    # Fallback: nearest compatible voxel within fallback_cells render cells of the segment.
+    rest = np.flatnonzero(~direct)
+    if len(rest):
+        reach = fallback_cells * spacing
+        lo = np.c_[xa[rest] - reach, ya[rest] - reach, z0[rest] - reach]
+        hi = np.c_[xb[rest] + reach, yb[rest] + reach, z1[rest] + reach]
+        best = np.full(len(rest), np.inf)
+        best_vid = np.full(len(rest), -1)
+        sub = {k: seg[k][rest] for k in seg}
+        for local, cand in _enumerate_boxes(lo, hi, voxel_size):
+            sid, vid = lookup(rest[local], cand)
+            local = np.searchsorted(rest, sid)  # rest is sorted: segment id -> position in rest
+            centre = (ijk[vid] + .5) * voxel_size
+            hd, dz = _rect_distance(centre, sub['xa'][local], sub['xb'][local], sub['ya'][local],
+                                    sub['yb'][local], sub['z0'][local], sub['z1'][local])
+            d = np.hypot(hd, dz)
+            ok = d <= reach + 1e-9
+            local, vid, d = local[ok], vid[ok], d[ok]
+            # Per segment: smallest distance, ties to the smallest voxel key (deterministic).
+            o = np.lexsort((keys[vid], d, local))
+            local, vid, d = local[o], vid[o], d[o]
+            first = np.r_[True, local[1:] != local[:-1]]
+            local, vid, d = local[first], vid[first], d[first]
+            better = d < best[local]
+            best[local[better]] = d[better]
+            best_vid[local[better]] = vid[better]
+        found = best_vid >= 0
+        rgb[rest[found]] = voxels['rgb'][best_vid[found]]
+        source[rest[found]] = 1
+    return rgb, source
+
+
+def build_walls(tile, grids, load_voxels, spacing, threshold=2.0, all_steps=False):
+    """Walls of one tile on its render grid, in the native CRS.
+
+    A vertical wall stands on every shared edge between two 4-adjacent render cells whose
+    heights differ by more than threshold, from the lower to the upper height, facing the lower
+    cell. Edges are taken from the merged window (merged_window, one-cell halo of the
+    neighbouring tiles); an edge belongs to the tile owning its west cell (east-west pairs) or
+    its south cell (north-south pairs), so a seam edge is built exactly once. Each wall is split
+    into ceil(dh / spacing) segments of equal height (<= spacing), coloured by colour_segments
+    from the facade voxels of every tile in the window; segments without voxels take the lower
+    cell's colour.
+
+    all_steps (study variant WALL2_BLOCK): walls on every edge with any height difference;
+    steps <= threshold take the lower cell's colour; the owned cells are also returned as flat
+    quads at their own height.
+
+    load_voxels(tile) -> dict(ijk, rgb, normal, count, voxel) of the tile's cache.
+    Returns quads (S,4,3) float64 [bottom a, bottom b, top b, top a], rgb (S,3) uint8,
+    normal (S,2), source (S,) int8 (index into SOURCES), edges, and with all_steps
+    cell_quads (C,4,3), cell_rgb (C,3).
+    """
+    names, owner, height, rgb, i0, j0 = merged_window(tile, grids)
+    me = names.index(tile)
+    own = owner == me
+    s = spacing
+    limit = 0. if all_steps else threshold
+    parts = []
+    # East-west pairs (r, c) | (r, c + 1): edge x = (i0 + c + 1) s, y in [(j0 + r) s, (j0 + r + 1) s].
+    a, b = height[:, :-1], height[:, 1:]
+    r, c = np.nonzero(own[:, :-1] & (owner[:, 1:] >= 0) & (np.abs(b - a) > limit))
+    west_low = height[r, c] < height[r, c + 1]
+    x = (i0 + c + 1) * s
+    parts.append(dict(xa=x, xb=x, ya=(j0 + r) * s, yb=(j0 + r + 1) * s,
+                      lo=np.minimum(height[r, c], height[r, c + 1]), hi=np.maximum(height[r, c], height[r, c + 1]),
+                      nx=np.where(west_low, -1., 1.), ny=np.zeros(len(r)),
+                      low_rgb=np.where(west_low[:, None], rgb[r, c], rgb[r, c + 1])))
+    # North-south pairs (r, c) / (r + 1, c): edge y = (j0 + r + 1) s, x in [(i0 + c) s, (i0 + c + 1) s].
+    a, b = height[:-1], height[1:]
+    r, c = np.nonzero(own[:-1] & (owner[1:] >= 0) & (np.abs(b - a) > limit))
+    south_low = height[r, c] < height[r + 1, c]
+    y = (j0 + r + 1) * s
+    parts.append(dict(xa=(i0 + c) * s, xb=(i0 + c + 1) * s, ya=y, yb=y,
+                      lo=np.minimum(height[r, c], height[r + 1, c]), hi=np.maximum(height[r, c], height[r + 1, c]),
+                      nx=np.zeros(len(r)), ny=np.where(south_low, -1., 1.),
+                      low_rgb=np.where(south_low[:, None], rgb[r, c], rgb[r + 1, c])))
+    edge = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
+    n_edges = len(edge['lo'])
+    # Vertical split into equal segments of height <= spacing.
+    dh = edge['hi'] - edge['lo']
+    n_split = np.maximum(1, np.ceil(dh / s - 1e-9).astype(np.int64))
+    eid = np.repeat(np.arange(n_edges), n_split)
+    k = np.arange(len(eid)) - np.repeat(np.cumsum(n_split) - n_split, n_split)
+    seg = {key: edge[key][eid] for key in ('xa', 'xb', 'ya', 'yb', 'nx', 'ny')}
+    seg['z0'] = edge['lo'][eid] + dh[eid] * k / n_split[eid]
+    seg['z1'] = edge['lo'][eid] + dh[eid] * (k + 1) / n_split[eid]
+    coloured = dh[eid] > threshold
+    rgb_seg = edge['low_rgb'][eid].astype(np.float64)
+    source = np.full(len(eid), 3, dtype=np.int8)
+    if coloured.any():
+        sub = {key: v[coloured] for key, v in seg.items()}
+        sets = [load_voxels(t) for t in names]
+        voxel_size = float(sets[0]['voxel'])
+        if any(abs(float(v['voxel']) - voxel_size) > 1e-9 for v in sets):
+            raise ValueError(f'Facade voxel sizes differ around {tile}')
+        # Only voxels that can reach the window (fallback radius included).
+        reach = WALL_FALLBACK_CELLS * s + voxel_size
+        x_lo, y_lo = i0 * s - reach, j0 * s - reach
+        x_hi, y_hi = (i0 + owner.shape[1]) * s + reach, (j0 + owner.shape[0]) * s + reach
+        clipped = []
+        for v in sets:
+            centre = (v['ijk'][:, :2] + .5) * voxel_size
+            keep = ((centre[:, 0] >= x_lo) & (centre[:, 0] <= x_hi) & (centre[:, 1] >= y_lo) & (centre[:, 1] <= y_hi))
+            clipped.append({key: v[key][keep] for key in ('ijk', 'rgb', 'normal', 'count')})
+        colour, src = colour_segments(sub, merge_voxels(clipped), voxel_size, s)
+        found = src < 2
+        idx = np.flatnonzero(coloured)
+        rgb_seg[idx[found]] = colour[found]
+        source[idx] = src
+    xa, xb, ya, yb, z0, z1 = (seg[key] for key in ('xa', 'xb', 'ya', 'yb', 'z0', 'z1'))
+    quads = np.stack([np.c_[xa, ya, z0], np.c_[xb, yb, z0], np.c_[xb, yb, z1], np.c_[xa, ya, z1]], 1)
+    result = dict(quads=quads, rgb=np.rint(rgb_seg).clip(0, 255).astype(np.uint8),
+                  normal=np.c_[seg['nx'], seg['ny']], source=source, edges=n_edges)
+    if all_steps:
+        r, c = np.nonzero(own)
+        x0, x1, y0, y1, z = (i0 + c) * s, (i0 + c + 1) * s, (j0 + r) * s, (j0 + r + 1) * s, height[r, c]
+        result['cell_quads'] = np.stack([np.c_[x0, y0, z], np.c_[x1, y0, z], np.c_[x1, y1, z], np.c_[x0, y1, z]], 1)
+        result['cell_rgb'] = rgb[r, c]
+    return result
+
+
+def facade_loader(cache_dir, maxsize=32):
+    """load_voxels(tile) for build_walls, reading the facade keys of <cache_dir>/<tile>.npz (cached)."""
+    @lru_cache(maxsize=maxsize)
+    def load(tile):
+        with np.load(Path(cache_dir) / f'{tile}.npz') as data:
+            if 'facade_ijk' not in data.files:
+                raise ValueError(f'{cache_dir}/{tile}.npz has no facade voxels (built with terrain_cache.py --no-facades)')
+            return dict(ijk=data['facade_ijk'].astype(np.int64), rgb=data['facade_rgb'], normal=data['facade_normal'],
+                        count=data['facade_count'], voxel=float(data['facade_voxel']))
+    return load
+
+
+# ----------------------------------------------------------------------------- output
+
+def convert_tile(grid, output, manifest, dataset, target, walls=None):
+    """Write the render .npz of one tile from its render_grid (and build_walls result)."""
+    h, rgb = grid['height'], grid['rgb']
+    rows, cols = h.shape
+    xx, yy = np.meshgrid(grid['x0'] + (np.arange(cols) + .5) * target, grid['y0'] + (np.arange(rows) + .5) * target)
+    local = to_local(np.c_[xx.ravel(), yy.ravel(), h.ravel()], manifest, dataset)
+    extra = {}
+    if walls is not None:
+        n = len(walls['quads'])
+        counts = np.bincount(walls['source'], minlength=len(SOURCES))
+        extra = dict(wall_vertices=to_local(walls['quads'].reshape(-1, 3), manifest, dataset).astype(np.float32),
+                     wall_rgb=np.repeat(walls['rgb'], 4, axis=0), wall_segments=n, wall_edges=walls['edges'],
+                     wall_sources=np.array(SOURCES), wall_source_counts=counts)
+    temporary = output.with_suffix('.npz.part')
+    with temporary.open('wb') as stream:
+        np.savez_compressed(stream, vertices=local.astype(np.float32), rgb=rgb.reshape(-1, 3),
+                            shape=np.array([rows, cols]), sampled_fraction=grid['sampled_fraction'],
+                            compute_device='cpu', compute_device_name='terrain_to_render.py', **extra)
+    temporary.replace(output)
+    return rows, cols
+
+
+def binned_shape(cache_path, target):
+    """(rows, cols) that convert_tile would write for this cache, without converting it."""
+    with np.load(cache_path) as data:
+        rows, cols = data['height'].shape
+        x0, y0, spacing = float(data['x0']), float(data['y0']), float(data['spacing'])
+    _, ci, fx = _axis_overlap(x0, spacing, cols, target)
+    _, ri, fy = _axis_overlap(y0, spacing, rows, target)
+    return int(np.max(np.where(fy < 1, ri + 1, ri))) + 1, int(np.max(np.where(fx < 1, ci + 1, ci))) + 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--cameras', type=Path, required=True)
+    parser.add_argument('--cache', type=Path, required=True, help='folder with <tile>.npz from terrain_cache.py')
+    parser.add_argument('--dataset', required=True)
+    parser.add_argument('--output', type=Path,
+                        help='default: <run>/terrain_render, where cameras.json is <run>/simulation/cameras.json')
+    parser.add_argument('--spacing', type=float, help="render grid spacing; default: cameras.json mesh_grid_spacing_m")
+    parser.add_argument('--walls', action='store_true',
+                        help='add vertical walls coloured from the facade voxels (cache not built with --no-facades)')
+    parser.add_argument('--wall-threshold', type=float, default=2.0,
+                        help='height difference (m) between adjacent render cells above which a wall is built')
+    parser.add_argument('--force', action='store_true')
+    parser.add_argument('--dry-run', action='store_true', help='report what would be converted, write nothing')
+    args = parser.parse_args()
+
+    if args.output is None:
+        args.output = args.cameras.resolve().parent.parent / 'terrain_render'
+    manifest = json.loads(args.cameras.read_text())
+    dataset = load_datasets()[args.dataset]
+    target = args.spacing or manifest['mesh_grid_spacing_m']
+    frame = {k: manifest[k] for k in ('origin_ecef_m', 'local_from_ecef')}
+    frame['mesh_grid_spacing_m'] = target
+    if args.walls:  # renders with and without walls must not share an output folder
+        frame['walls'] = dict(threshold_m=args.wall_threshold, max_angle_deg=WALL_MAX_ANGLE_DEG,
+                              fallback_cells=WALL_FALLBACK_CELLS)
+    frame_path = args.output / 'cache_frame.json'
+    if frame_path.exists() and json.loads(frame_path.read_text()) != frame:
+        raise ValueError('Frame, spacing or wall settings differ from the existing output; use a new output directory')
+    if not args.dry_run:
+        args.output.mkdir(parents=True, exist_ok=True)
+        frame_path.write_text(json.dumps(frame, indent=2) + '\n')
+    tiles = run_tiles(dataset, manifest)
+    missing = [t for t in tiles if not (args.cache / f'{t}.npz').exists()]
+    todo = [t for t in tiles if t not in missing and (args.force or not (args.output / f'{t}.npz').exists())]
+    grids = {}
+    if args.walls and todo and not args.dry_run:
+        # Walls need the neighbours' grids (halo) and voxels: build every available grid first.
+        grids = {t: render_grid(args.cache / f'{t}.npz', target) for t in tiles if t not in missing}
+        load_voxels = facade_loader(args.cache)
+    done, kept, vertices, triangles, wall_triangles = 0, 0, 0, 0, 0
+    sources = np.zeros(len(SOURCES), dtype=np.int64)
+    for tile in tiles:
+        if tile in missing:
+            continue
+        source, destination = args.cache / f'{tile}.npz', args.output / f'{tile}.npz'
+        if tile not in todo:
+            with np.load(destination) as data:  # already converted: count what the renderer will load
+                rows, cols = (int(n) for n in data['shape'])
+                if 'wall_segments' in data.files:
+                    wall_triangles += 2 * int(data['wall_segments'])
+                    sources += data['wall_source_counts']
+            kept += 1
+        elif args.dry_run:
+            rows, cols = binned_shape(source, target)
+            done += 1
+        else:
+            grid = grids[tile] if grids else render_grid(source, target)
+            walls = build_walls(tile, grids, load_voxels, target, args.wall_threshold) if args.walls else None
+            rows, cols = convert_tile(grid, destination, manifest, dataset, target, walls)
+            if walls is not None:
+                wall_triangles += 2 * len(walls['quads'])
+                sources += np.bincount(walls['source'], minlength=len(SOURCES))
+                print(f'{tile}: {walls["edges"]:,} wall edges, {len(walls["quads"]):,} segments '
+                      f'({", ".join(f"{n} {k}" for k, n in zip(SOURCES, np.bincount(walls["source"], minlength=len(SOURCES))))})',
+                      flush=True)
+            done += 1
+        vertices += rows * cols
+        triangles += 2 * (rows - 1) * (cols - 1)  # two per grid cell, as render_swarm.py builds them
+    print(f'{"would convert" if args.dry_run else "converted"} {done} tiles at {target:g} m, '
+          f'{kept} already present; {done + kept} tiles, {vertices:,} vertices, '
+          f'{triangles:,} triangles -> {args.output}')
+    if args.walls and not args.dry_run:
+        print(f'walls: {wall_triangles // 2:,} segments, {wall_triangles:,} triangles; segment colour from '
+              + ', '.join(f'{k} {n:,}' for k, n in zip(SOURCES, sources)))
+    if missing:
+        raise SystemExit(f'{len(missing)} selected tiles missing from the cache: {missing[:10]}...')
+
+
+if __name__ == '__main__':
+    main()

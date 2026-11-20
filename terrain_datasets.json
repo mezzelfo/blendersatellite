@@ -7,6 +7,13 @@
     "projected_epsg": 7855,
     "geographic_epsg": 7844,
     "vertical": "AHD, used as approximate ellipsoidal height downstream",
+    "target": {
+      "projected_xy": [
+        320877.49072265625,
+        5812809.471992493
+      ],
+      "note": "scene point overflown at capture time, in projected_epsg (the point of all Melbourne runs so far)"
+    },
     "index": {
       "type": "arcgis",
       "url": "https://services1.arcgis.com/KGdHCCUjGBpOPPac/arcgis/rest/services/Photomesh_2020_OBJ_Grid/FeatureServer/0/query?where=1%3D1&outFields=Region&returnGeometry=true&outSR=7855&f=json",

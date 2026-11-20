@@ -60,13 +60,13 @@ data/terrain/<dataset>/
 `cameras.json`), adds the walls (`--walls`) and converts everything into the local
 ENU frame of one simulation run. These render grids go to `<run>/terrain_render/`
 and are tied to that run's local frame (`cache_frame.json` guards against reuse
-with another frame or other wall settings). `run_orbits_melbourne.sh` runs both
+with another frame or other wall settings). `pipeline/run_swarm.sh` runs both
 steps, with walls unless `WALLS=0` (see below); by hand, for an existing run:
 
 ```bash
-python terrain_cache.py --dataset melbourne_2020 --tiles-from <run>/simulation/cameras.json \
+python pipeline/terrain_cache.py --dataset melbourne_2020 --tiles-from <run>/simulation/cameras.json \
     --spacing 1 --workers 12 [--archives /path/to/already/downloaded/zips]
-python terrain_to_render.py --cameras <run>/simulation/cameras.json \
+python pipeline/terrain_to_render.py --cameras <run>/simulation/cameras.json \
     --cache data/terrain/melbourne_2020/1m --dataset melbourne_2020 --walls [--wall-threshold 2]
 ```
 
@@ -113,7 +113,7 @@ vertical walls coloured from the original facades.
 - **Renders with and without walls must not be mixed in one experiment.** `cache_frame.json`
   records the wall settings, so `--walls` refuses an output folder made without walls and the
   reverse; convert into a separate folder (e.g. `terrain_render_grid`) to get the other kind.
-- `run_orbits_melbourne.sh`: `WALLS=1` (default) passes `--walls --wall-threshold
+- `pipeline/run_swarm.sh`: `WALLS=1` (default) passes `--walls --wall-threshold
   "$WALL_THRESHOLD"` to `terrain_to_render.py`; `WALLS=0` converts the same cache as the
   grid only. `WALL_THRESHOLD` (default `2`, metres) is the height step above which a wall is
   built. The choice is printed at the start of `pipeline.log`. Both render modes (frames and
@@ -158,8 +158,10 @@ Adding a dataset: add an entry to `terrain_datasets.json`.
 - `projected_epsg`: CRS of the mesh and of the cache grid.
 - `geographic_epsg`: geographic CRS of the same datum; `terrain_to_render.py`
   transforms projected -> geographic -> ECEF (EPSG:4979 -> 4978).
-- `vertical`: how heights are treated (informational; heights are used as ellipsoidal).
-- `index`: tile index for `--bbox` and `--all`: `url` of an ArcGIS JSON query with
+- `vertical`: how heights are treated (informational, copied to `cameras.json`; heights are used as ellipsoidal).
+- `target`: `projected_xy`, the scene point (in `projected_epsg`) overflown by the chief at capture
+  time; required by `pipeline/run_swarm.sh`.
+- `index`: tile index for `--bbox`, `--all` and the run selection of `--tiles-from`: `url` of an ArcGIS JSON query with
   polygon `geometry.rings`, `id_field` (attribute holding the tile id used in `url`),
   `local_copy` (path relative to the repository, used instead of the URL if present).
 - `description`, `license`: copied to `dataset.json`.
@@ -168,17 +170,26 @@ Renders made with this terrain differ in colour from `eevee_full_1000` (cell mea
 instead of one texel per cell: about 12 DN mean |dRGB| on the chief PNGs, no
 geometric shift, step 18). Frames rendered with the two terrains must not be mixed
 in one experiment. The terrain of `eevee_full_1000` (built by the deprecated
-`prepare_swarm_terrain.py`, formerly `data/swarm_terrain`) is kept in
+`archive/prepare_swarm_terrain.py`, formerly `data/swarm_terrain`) is kept in
 `output/orbits_melbourne/eevee_full_1000/terrain_render_legacy/`; pass it with
-`TERRAIN=...` to `scripts/render_job.sh` to extend that experiment.
+`TERRAIN=...` to `archive/render_job.sh` to extend that experiment.
 
 ### Orbit-driven HyperScape100 preview
 
 Activate the `orbits` conda environment, then run from this directory:
 
 ```bash
-bash run_orbits_melbourne.sh
+bash pipeline/run_swarm.sh                       # DATASET=melbourne_2020 by default
+DATASET=<key> bash pipeline/run_swarm.sh         # any dataset of terrain_datasets.json
 ```
+
+The simulation is the same for every dataset. `DATASET` selects an entry of
+`terrain_datasets.json`; its `target.projected_xy` (in the dataset's `projected_epsg`) is the
+scene point overflown by the chief at capture time. The wrapper converts it to geographic
+lon/lat and passes it to `melbourne_overpass.py --target`; the tiles are then selected by
+`pipeline/terrain_cache.py` from the dataset index, as the tiles whose footprint overlaps the
+run's `terrain_bounds_local_m` (`run_tiles`). Runs go to `output/<dataset>/`; the earlier
+Melbourne runs stay in `output/orbits_melbourne/`.
 
 The wrapper requires CUDA for the orbit integration (default `cuda:0`). Rendering uses every
 GPU it finds (see "Rendering on every GPU" below); without any GPU, Cycles falls back to one CPU
@@ -196,14 +207,14 @@ metadata and `render_report.jsonl` record the actual selected devices. Terrain p
 runs on the CPU: `TERRAIN_WORKERS` (default 4) sets the number of
 `terrain_cache.py` processes and `TERRAIN_SPACING` (default `1`; `1`, `1.0` and
 `1.00` all use the same `1m/` cache folder) the cache spacing in metres;
-`MELBOURNE_ARCHIVES=/path/to/zips` reuses already downloaded ZIPs. `WALLS` (default
+`TERRAIN_ARCHIVES=/path/to/zips` reuses already downloaded tile archives. `WALLS` (default
 `1`) and `WALL_THRESHOLD` (default `2` m) choose the terrain with or without walls
 (see Terrain data, "Walls from the photomesh facades"). GPU denoising
 is disabled for these small previews so it does not introduce an unsupported
 CPU denoising pass.
 
-This runs `orbits/scripts/melbourne_overpass.py`, fills the terrain cache with
-the selected tiles and converts them into `<run>/terrain_render` (see Terrain
+This runs `orbits/scripts/melbourne_overpass.py` (despite the name, for any target), fills the
+terrain cache with the selected tiles and converts them into `<run>/terrain_render` (see Terrain
 data), then starts headless Blender with `render_swarm.py`.
 The default formation is a five-satellite train with the chief in the middle:
 `deputy 1 → deputy 2 → chief → deputy 3 → deputy 4`. Every adjacent pair is
@@ -216,12 +227,12 @@ trajectory. Separation is not constrained by stationkeeping. Measured pair
 distances and adjacent extrema over the sampled minute are saved in each run's
 `simulation/formation_distances.json`.
 
-Use `TRAIN_SPACING_M=100000 bash run_orbits_melbourne.sh` for a 100 km train, or
-`FORMATION=random bash run_orbits_melbourne.sh` for the former compact random
+Use `TRAIN_SPACING_M=100000 bash pipeline/run_swarm.sh` for a 100 km train, or
+`FORMATION=random bash pipeline/run_swarm.sh` for the former compact random
 swarm. The standalone exporter accepts `--formation` and `--train-spacing-m`.
 
-`ACQUISITION=hex7_sync.json bash run_orbits_melbourne.sh` and
-`ACQUISITION=hex7_async_10deg.json bash run_orbits_melbourne.sh` fly the ROE hexagon
+`ACQUISITION=hex7_sync.json bash pipeline/run_swarm.sh` and
+`ACQUISITION=hex7_async_10deg.json bash pipeline/run_swarm.sh` fly the ROE hexagon
 of `orbits/data/formations/roe_hex7_dmax1km.json` with an acquisition file of
 `orbits/data/acquisitions/` (exporter option `--acquisition`). The file sets the
 formation file, the mode, the roles, the incidence, the detector-line rule, the
@@ -236,7 +247,7 @@ docstring of `orbits/src/orbits/acquisition.py`. Each camera record carries its 
 the time of the chief. `orbits/scripts/validate_acquisition.py` checks an exported run.
 
 `RENDER_MODE=raw` keeps only the raw pushbroom data instead of the full frames
-(`scripts/render_to_raw.py`): frames 0 and 999 fix the detector rows that see the
+(`pipeline/render_to_raw.py`): frames 0 and 999 fix the detector rows that see the
 scene over the whole window for every satellite, 32 bands of 8 adjacent rows (start
 rows multiples of 4) are spread over them, and the run is rendered as tasks of
 `RENDER_CHUNK` (default 20) frames of one satellite, the chunks with frames 0 and 999
@@ -247,14 +258,14 @@ frame every 100 (and the last), moved to `reference_frames/`, while the workers 
 rendering. About 4.2 GB per satellite instead of 8.2 GB of PNGs; launching the same command
 again resumes from `raw/progress.json` (extracted (satellite, frame) pairs under `done`;
 `frames` lists the frames extracted for every satellite, as before).
-Example: `ACQUISITION=hex7_async_10deg.json RENDER_MODE=raw bash run_orbits_melbourne.sh --engine EEVEE`.
+Example: `ACQUISITION=hex7_async_10deg.json RENDER_MODE=raw bash pipeline/run_swarm.sh --engine EEVEE`.
 Do not pass `--frames` or `--satellites` in this mode.
 `RAW_KEEP_FRAMES=1` extracts the raw rows but keeps every PNG (no deletion).
 `RAW_BLOCK` is gone (replaced by `RENDER_CHUNK`).
-`scripts/build_cubes.py --run RUN --layout raw_bands --mode none|linear|bilinear --source raw|png`
+`pipeline/build_cubes.py --run RUN --layout raw_bands --mode none|linear|bilinear --source raw|png`
 builds the cubes on the ground from either source (identical results); `bilinear` follows the
 column drift of oblique (fore/aft) views, `linear` keeps the column fixed, `none` steps whole frames.
-#### Rendering on every GPU (`scripts/render_pool.py`)
+#### Rendering on every GPU (`pipeline/render_pool.py`)
 
 Both render modes run persistent Blender workers on every selected GPU, fed by a task queue.
 Nothing is specific to one machine: devices are found and identified at start.
@@ -262,7 +273,7 @@ Nothing is specific to one machine: devices are found and identified at start.
 - **Devices.** The GPUs are listed with `nvidia-smi` (index, UUID, PCI bus id, memory) when it
   is present, else from the devices Blender reports. Each GPU is mapped to Blender's device by
   identity, never by position. EEVEE: one Blender probe per Vulkan device
-  (`scripts/vulkan_gpu_probe.py --json`, run with `--gpu-backend vulkan --gpu-device N
+  (`pipeline/vulkan_gpu_probe.py --json`, run with `--gpu-backend vulkan --gpu-device N
   --gpu-device-no-fallback`) renders a 64 px image and reads its own UUID from `nvidia-smi`;
   software devices (llvmpipe) are dropped. On osiride (Blender 5.3) Vulkan 0 = nvidia-smi GPU 1
   and Vulkan 1 = GPU 0, Vulkan 2 = llvmpipe. Without Vulkan, OpenGL gives one worker on the
@@ -271,7 +282,7 @@ Nothing is specific to one machine: devices are found and identified at start.
   `--gpu-devices <id>` (`render_swarm.py --gpu-devices` now takes indices, ids or `cpu`).
   No GPU: one CPU Cycles worker (EEVEE needs a GPU).
 - **Options** (`render_to_raw.py` and `render_pool.py`; environment of
-  `run_orbits_melbourne.sh` in brackets): `--gpus all|LIST` (`GPUS`, default all; nvidia-smi
+  `pipeline/run_swarm.sh` in brackets): `--gpus all|LIST` (`GPUS`, default all; nvidia-smi
   index or UUID, `bN` = Blender device N), `--device-map GPU=BLENDER_DEVICE,...` (`DEVICE_MAP`)
   where the probe cannot identify a device, `--max-workers-per-gpu` (`MAX_WORKERS_PER_GPU`,
   default 4), `--workers-per-gpu N` (`WORKERS_PER_GPU`, fixed number, no measuring),
@@ -326,14 +337,14 @@ Nothing is specific to one machine: devices are found and identified at start.
   zlib 0..9 and every value below 10 stores the image uncompressed (48 MiB per frame instead of
   7.5 MiB) for 0.17 s less per frame (-5%); pixels and raw files are identical. The raw mode
   keeps 15: with 0 its PNGs in flight and the reference frames take 6.4x the disk.
-- **Frames mode** (`RENDER_MODE` unset) runs `scripts/render_pool.py`, the same pool without
+- **Frames mode** (`RENDER_MODE` unset) runs `pipeline/render_pool.py`, the same pool without
   extraction; `--frames`, `--satellites` and `--crop` after the wrapper are honoured,
   `--check-only` runs one process as before. `render_swarm.py` alone still works as before
-  (`--frames` now defaults to every epoch). `scripts/render_job.sh` is superseded; it now finds
+  (`--frames` now defaults to every epoch). `archive/render_job.sh` is superseded; it now finds
   its Vulkan device with the probe instead of a fixed osiride mapping.
 
 Every invocation creates a fresh directory such as
-`output/orbits_melbourne/20261028T171037Z_run_8bJvD7/`; the UTC timestamp plus
+`output/<dataset>/20261028T171037Z_run_8bJvD7/`; the UTC timestamp plus
 unique suffix prevents collisions even for simultaneous runs. `RUNS_ROOT`
 changes the root directory; passing `--output` to the wrapper is disallowed.
 Existing runs are never overwritten. Each directory contains:
@@ -394,11 +405,11 @@ the nearest sample; nonfinite source UVs receive neutral gray. This upper-surfac
 mesh simplifies façades/overhangs. Its emission material preserves illumination
 already baked into the aerial textures. Images do not simulate a new Sun
 position; transparent pixels identify missing geometry at tile boundaries or
-outside the published dataset. The deprecated `prepare_swarm_terrain.py` (one
+outside the published dataset. The deprecated `archive/prepare_swarm_terrain.py` (one
 texel per 2.5 m cell, read from already downloaded ZIPs) is kept only to
-reproduce `eevee_full_1000` and for `test_swarm_terrain.py`.
+reproduce `eevee_full_1000` and for `archive/test_swarm_terrain.py`.
 
-`TERRAIN_WORKERS=1 bash run_orbits_melbourne.sh --samples 4` reduces resource
+`TERRAIN_WORKERS=1 bash pipeline/run_swarm.sh --samples 4` reduces resource
 use; `BLENDER_BIN=/path/to/blender` selects another build. Subsequent runs
 reuse terrain caches. Direct stage commands accept `--help` (Blender arguments
 follow `--`). `render_swarm.py --check-only` validates the five exported
@@ -419,8 +430,8 @@ four-sample views:
 ```bash
 mkdir -p data/melbourne
 unzip ../OBJ/melbourne_obj/C4-22.zip -d data/melbourne
-python3 prepare_melbourne_tile.py
-./run_melbourne.sh
+python3 affine/prepare_melbourne_tile.py
+./affine/run_melbourne.sh
 ```
 
 The preparation step creates `data/melbourne/C4-22/C4-22.local.obj` and an exact
@@ -435,7 +446,7 @@ writes three images plus `render_metadata.json` to
 for example:
 
 ```bash
-./run_melbourne.sh --resolution 256 --samples 2 --camera-indices 0,6,13
+./affine/run_melbourne.sh --resolution 256 --samples 2 --camera-indices 0,6,13
 ```
 
 Set `BLENDER_BIN=/path/to/blender` when Blender is installed elsewhere. OSL
@@ -445,15 +456,29 @@ Cycles deliberately.
 ## Important repository layout
 
 - `main.py` — the Blender script that reads affine models, converts them to OSL camera code, attaches the OSL to the `Camera` data-block, configures a `Light`, and renders.
-- `prepare_melbourne_tile.py` — recenters/scales a georeferenced Melbourne OBJ and records the transform.
-- `render_melbourne.py` — imports the textured OBJ and renders selected affine views.
-- `run_melbourne.sh` — headless Blender wrapper for the Melbourne renderer.
+- `affine/prepare_melbourne_tile.py` — recenters/scales a georeferenced Melbourne OBJ and records the transform.
+- `affine/render_melbourne.py` — imports the textured OBJ and renders selected affine views.
+- `affine/run_melbourne.sh` — headless Blender wrapper for the Melbourne renderer.
 - `EOGS_affine_models/` — per-scene subfolders (e.g. `JAX_068`, `IARPA_001`, ...) each containing `affine_models.json`, `train.txt`, `test.txt`.
 - `output/` — target folder where rendered PNGs are written.
 
+Orbit-driven swarm pipeline:
+
+- `terrain_datasets.json`: terrain datasets (download URL, CRS, tile index, target point).
+- `pipeline/`: the pipeline. Entry point: `run_swarm.sh` (orbit simulation, terrain download and
+  conversion, rendering). Terrain: `terrain_cache.py` (downloads and caches the mesh tiles),
+  `terrain_to_render.py` (render grids in the run's local frame). Rendering: `render_swarm.py` (Blender),
+  `render_pool.py` (workers on every GPU), `render_to_raw.py` (raw mode), `vulkan_gpu_probe.py`.
+  Cubes: `build_cubes.py`, `cube_stacking.py`, `stacking_geometry.py`, `export_cube_band_samples.py`.
+- `validation/`: validation and analysis scripts of the single steps (they import from `pipeline/`).
+- `tests/`: tests of the pipeline, `python -m pytest tests/ -q` in the conda environment `orbits`.
+- `archive/`: superseded scripts and the terrain 3D study of step 20, kept for reference; their paths
+  are not updated and they may not run from there.
+- `Prompts/`: step-by-step prompts and reports of the development (historical paths).
+
 ## Assumptions and notes
 
-- Blender drivers must run through `run.sh` or `run_melbourne.sh`; do not call
+- Blender drivers must run through `run.sh` or `affine/run_melbourne.sh`; do not call
   `main.py` or `render_melbourne.py` with system Python because `bpy` is only
   available inside Blender. `prepare_melbourne_tile.py` is intentionally a
   standalone system-Python preprocessing tool.
@@ -463,7 +488,7 @@ Cycles deliberately.
   overridden without editing the script:
 
 ```bash
-BLENDER_BIN=/path/to/blender ./run_melbourne.sh
+BLENDER_BIN=/path/to/blender ./affine/run_melbourne.sh
 ```
 
 ## Requirements
