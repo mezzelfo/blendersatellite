@@ -150,10 +150,15 @@ towers), and the phase-correlation shift is (0, 0).
 
 Adding a dataset: add an entry to `terrain_datasets.json`.
 
-- `format`: reader in `terrain_cache.READERS`. `obj_zip` expects one ZIP per tile
-  holding one `.obj` (all `v`/`vt` lines before the faces, coordinates in metres
-  of `projected_epsg`, z up) and optionally a `.mtl` whose `map_Kd` textures are
-  in the ZIP.
+- `format`: reader in `terrain_cache.READERS`. `obj_zip` expects one ZIP per tile holding
+  OBJ files (in each, all `v`/`vt` lines before the faces, metres, z up) with their `.mtl`
+  (`mtllib`, else the first MTL of the ZIP) and `map_Kd` textures in the ZIP. One OBJ
+  (Melbourne), several sub-tiles (Espoo) or a ContextCapture level-of-detail tree
+  `<tile>_L<level>[_<path>].obj` (Helsinki), of which only the leaves are read.
+- `mesh_origin` (optional): `[x, y, z]` added to every vertex, for meshes in coordinates
+  local to an origin; a `metadata.xml` in the ZIP must declare the same `SRSOrigin`.
+- `raster_bounds` (optional): `tile` takes the grid extent of a tile from its index polygon
+  (archives cut at the tile edges); default `vertices`, the extent of the mesh.
 - `url`: download URL template with `{tile}`; used when the tile is not in `--archives`.
 - `projected_epsg`: CRS of the mesh and of the cache grid.
 - `geographic_epsg`: geographic CRS of the same datum; `terrain_to_render.py`
@@ -161,9 +166,17 @@ Adding a dataset: add an entry to `terrain_datasets.json`.
 - `vertical`: how heights are treated (informational, copied to `cameras.json`; heights are used as ellipsoidal).
 - `target`: `projected_xy`, the scene point (in `projected_epsg`) overflown by the chief at capture
   time; required by `pipeline/run_swarm.sh`.
-- `index`: tile index for `--bbox`, `--all` and the run selection of `--tiles-from`: `url` of an ArcGIS JSON query with
-  polygon `geometry.rings`, `id_field` (attribute holding the tile id used in `url`),
-  `local_copy` (path relative to the repository, used instead of the URL if present).
+- `index`: tile index for `--bbox`, `--all` and the run selection of `--tiles-from`. Type
+  `arcgis`: `url` of an ArcGIS JSON query with polygon `geometry.rings`, `id_field` (attribute
+  holding the tile id used in `url`), `local_copy` (path relative to the repository, used
+  instead of the URL if present). Type `grid`: square tiles of `tile_size_m` listed in
+  `tiles`; `id_regex` has named groups `x` and `y`, and the south-west corner of a tile is
+  `x_origin_m + id_unit_m * x`, `y_origin_m + id_unit_m * y`.
+
+Datasets in `terrain_datasets.json`: `melbourne_2020` (570 tiles, 113.7 GB), `helsinki_2017`
+(122 tiles of 2 km, 190.4 GB, levels L13-L21, leaves at L21, origin 25490000, 6668000) and
+`espoo_2017` (Espoo and Kauniainen, 140 tiles of 2 km, 75.9 GB, origin 25481691, 6680412), both
+in EPSG:3879. The Finnish datasets have no `target` yet, which `pipeline/run_swarm.sh` needs.
 - `description`, `license`: copied to `dataset.json`.
 
 Renders made with this terrain differ in colour from `eevee_full_1000` (cell mean

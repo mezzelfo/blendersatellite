@@ -12,6 +12,7 @@ The step-22 tests below (facades and walls) add tiles WALLS, SEAM_W and SEAM_E.
 
   conda run -n orbits python -m pytest -q tests/test_terrain_cache.py
 """
+import io
 import json
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from pyproj import Transformer
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'pipeline'))
 from terrain_to_render import bin_to_spacing  # noqa: E402
+import terrain_cache as tc  # noqa: E402
 
 X0, Y0, SIZE, SLOPE = 320000.0, 5810000.0, 300.0, 0.01
 SPACINGS = (1.0, 2.5)
@@ -507,3 +509,147 @@ def test_download_error_is_picklable(tmp_path, monkeypatch):
     restored = pickle.loads(pickle.dumps(caught.value))
     assert 'HTTP Error 403: Forbidden' in str(restored) and url in str(restored)
     assert not (tmp_path / 'TILE.zip.part').exists()
+
+
+# ----------------------------------------------------------------------------- archives of several OBJs
+
+GK_ORIGIN = (25490000.0, 6668000.0, 0.0)   # mesh_origin of a ContextCapture export (Helsinki)
+PALETTE = dict(red=(255, 0, 0), green=(0, 255, 0), blue=(0, 0, 255), grey=(128, 128, 128))
+
+
+def quad_obj(name, x0, x1, y0, y1, z):
+    """OBJ text of one flat textured quad (local coordinates), with mtllib <name>.mtl."""
+    lines = [f'mtllib {name}.mtl']
+    lines += [f'v {x:.6f} {y:.6f} {z:.6f}' for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
+    lines += ['vt 0.25 0.25', 'vt 0.75 0.25', 'vt 0.75 0.75', 'vt 0.25 0.75', f'usemtl {name}_0',
+              'f 1/1 2/2 3/3', 'f 1/1 3/3 4/4']
+    return '\n'.join(lines) + '\n'
+
+
+def add_node(archive, folder, name, colour, quad):
+    """Write <folder>/<name>.obj, .mtl and a one-colour PNG texture into an open ZipFile."""
+    buffer = io.BytesIO()
+    Image.fromarray(np.full((8, 8, 3), PALETTE[colour], dtype=np.uint8)).save(buffer, format='PNG')
+    archive.writestr(f'{folder}/{name}.obj', quad_obj(name, *quad))
+    archive.writestr(f'{folder}/{name}.mtl', f'newmtl {name}_0\nKd 1 1 1\nmap_Kd {name}_0.png\n')
+    archive.writestr(f'{folder}/{name}_0.png', buffer.getvalue())
+
+
+def lod_tree_zip(path, origin=GK_ORIGIN):
+    """Helsinki-like archive: one sub-tile with a two-level tree over local x 0..100, y 0..50.
+    The coarse root (red, 50 m high) must be ignored; leaves: west green 10 m, east blue 20 m.
+    A third leaf is an empty file (as in the real archives) and an L15 child sits under the west
+    leaf's sibling to check that only childless nodes are kept."""
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as archive:
+        if origin is not None:
+            archive.writestr('metadata.xml', '<ModelMetadata version="1"><SRS>EPSG:3879+5773</SRS>'
+                             f'<SRSOrigin>{origin[0]:g},{origin[1]:g},{origin[2]:g}</SRSOrigin></ModelMetadata>')
+        add_node(archive, 'sub', 'Tile_+000_+000_L13', 'red', (0., 100., 0., 50., 50.))
+        add_node(archive, 'sub', 'Tile_+000_+000_L14_0', 'green', (0., 50., 0., 50., 10.))
+        add_node(archive, 'sub', 'Tile_+000_+000_L14_1', 'grey', (50., 100., 0., 50., 30.))
+        add_node(archive, 'sub', 'Tile_+000_+000_L15_10', 'blue', (50., 100., 0., 50., 20.))
+        archive.writestr('sub/Tile_+000_+000_L15_11.obj', '')
+
+
+def test_mesh_objs_keeps_leaves():
+    names = ['a/T_L13.obj', 'a/T_L14_0.obj', 'a/T_L14_1.obj', 'a/T_L15_10.obj', 'a/T_L15_11.obj',
+             'b/Tile_+056_+014.obj', 'C4-22.obj', 'a/T_L13.mtl']
+    sizes = dict.fromkeys(names, 10)
+    sizes['a/T_L15_11.obj'] = 0
+    assert tc.mesh_objs(names, sizes) == ['C4-22.obj', 'a/T_L14_0.obj', 'a/T_L15_10.obj', 'b/Tile_+056_+014.obj']
+
+
+def test_lod_tree_leaves_with_origin(tmp_path):
+    lod_tree_zip(tmp_path / 'T.zip')
+    x0, y0 = GK_ORIGIN[:2]
+    grid = tc.rasterise_obj_zip(tmp_path / 'T.zip', 1.0, 2, origin=GK_ORIGIN, bounds=(x0, y0, x0 + 100, y0 + 50))
+    assert (grid['x0'], grid['y0']) == (x0, y0) and grid['height'].shape == (50, 100)
+    assert grid['objs'] == 2 and (grid['coverage'] == 4).all()
+    assert np.allclose(grid['height'][:, :50], 10) and np.allclose(grid['height'][:, 50:], 20)
+    assert (grid['rgb'][:, :50] == PALETTE['green']).all() and (grid['rgb'][:, 50:] == PALETTE['blue']).all()
+
+
+def test_several_objs_without_bounds_cover_the_vertices(tmp_path):
+    lod_tree_zip(tmp_path / 'T.zip')
+    grid = tc.rasterise_obj_zip(tmp_path / 'T.zip', 1.0, 2, origin=GK_ORIGIN)
+    assert (grid['x0'], grid['y0']) == GK_ORIGIN[:2] and grid['height'].shape == (50, 100)
+
+
+def test_flat_subtiles_with_origin(tmp_path):
+    """Espoo-like archive: two sub-tile folders with one OBJ each, inside a larger tile box."""
+    origin = (25481691.0, 6680412.0, 0.0)
+    with zipfile.ZipFile(tmp_path / 'E.zip', 'w') as archive:
+        add_node(archive, 'Tile_+000_+000', 'Tile_+000_+000', 'green', (1309., 1359., -17412., -17362., 5.))
+        add_node(archive, 'Tile_+000_+001', 'Tile_+000_+001', 'blue', (1359., 1409., -17412., -17362., 7.))
+    box = (25483000.0, 6663000.0, 25483100.0, 6663100.0)   # vertices: x 25483000..25483100, y 6663000..6663050
+    grid = tc.rasterise_obj_zip(tmp_path / 'E.zip', 1.0, 2, origin=origin, bounds=box)
+    # northern half of the box has no mesh: the grid is cropped to the covered cells
+    assert grid['height'].shape == (50, 100) and grid['objs'] == 2
+    assert (grid['x0'], grid['y0']) == box[:2]
+    assert np.allclose(grid['height'][:, :50], 5) and np.allclose(grid['height'][:, 50:], 7)
+    assert (grid['rgb'][:, 50:] == PALETTE['blue']).all()
+    # faces beyond the box (Espoo sub-tiles overlap their neighbours by 1 m) are clipped
+    clipped = tc.rasterise_obj_zip(tmp_path / 'E.zip', 1.0, 2, origin=origin,
+                                   bounds=(box[0], box[1], box[0] + 80, box[1] + 30))
+    assert clipped['height'].shape == (30, 80)
+
+
+def test_origin_must_match_metadata(tmp_path):
+    lod_tree_zip(tmp_path / 'T.zip')
+    with pytest.raises(ValueError, match='SRSOrigin'):
+        tc.rasterise_obj_zip(tmp_path / 'T.zip', 1.0, 2, origin=(25490000.0, 6670000.0, 0.0))
+    with pytest.raises(ValueError, match='SRSOrigin'):
+        tc.rasterise_obj_zip(tmp_path / 'T.zip', 1.0, 2)
+
+
+GRID_SPEC = dict(type='grid', tile_size_m=2000, x_origin_m=25000000, y_origin_m=6000000, id_unit_m=1000)
+
+
+@pytest.mark.parametrize('regex, tile, corner', [
+    (r'^(?P<y>\d{3})(?P<x>\d{3})x2$', '666502x2', (25502000, 6666000)),   # Helsinki: north first
+    (r'^(?P<x>\d{3})(?P<y>\d{3})x2$', '483663x2', (25483000, 6663000)),   # Espoo: east first
+])
+def test_grid_index(regex, tile, corner):
+    ring = tc.grid_index(dict(GRID_SPEC, id_regex=regex, tiles=[tile]))[tile]
+    assert tuple(ring.min(0)) == corner and tuple(ring.max(0) - ring.min(0)) == (2000, 2000)
+
+
+def test_process_tile_and_run_selection_on_a_grid_dataset(tmp_path):
+    """A Helsinki-like dataset end to end: run selection from a manifest, then one cached tile."""
+    archives, out = tmp_path / 'archives', tmp_path / 'out'
+    archives.mkdir(); out.mkdir()
+    dataset = dict(format='obj_zip', url='https://example.invalid/{tile}.zip', projected_epsg=3879,
+                   geographic_epsg=4258, mesh_origin=list(GK_ORIGIN), raster_bounds='tile',
+                   index=dict(GRID_SPEC, id_regex=r'^(?P<y>\d{3})(?P<x>\d{3})x2$',
+                              tiles=['668490x2', '668492x2', '670490x2']))
+    lod_tree_zip(archives / '668490x2.zip')
+    # Local ENU frame on the tile 668490x2 (south-west corner 25490000, 6668000).
+    to_geo = Transformer.from_crs(3879, 4258, always_xy=True)
+    to_ecef = Transformer.from_crs(4979, 4978, always_xy=True)
+    lon, lat = to_geo.transform(25490500.0, 6668500.0)
+    origin = np.array(to_ecef.transform(lon, lat, 0.))
+    lo, la = np.deg2rad([lon, lat])
+    east = np.array([-np.sin(lo), np.cos(lo), 0.])
+    north = np.array([-np.sin(la) * np.cos(lo), -np.sin(la) * np.sin(lo), np.cos(la)])
+    manifest = dict(origin_ecef_m=origin.tolist(), local_from_ecef=[east.tolist(), north.tolist(),
+                    np.cross(east, north).tolist()], terrain_bounds_local_m=[[-400., -400.], [400., 400.]])
+    assert tc.run_tiles(dataset, manifest) == ['668490x2']
+    bounds = tc.tile_bounds(dataset, ['668490x2'])['668490x2']
+    assert bounds == (25490000.0, 6668000.0, 25492000.0, 6670000.0)
+    record = tc.process_tile('test', dataset, '668490x2', out, 2.0, 2, archives, True, 1.0, bounds)
+    assert record['objs'] == 2 and record['shape'] == [25, 50]   # 100 m x 50 m of mesh at 2 m
+    with np.load(out / '668490x2.npz') as cached:
+        assert (float(cached['x0']), float(cached['y0'])) == bounds[:2]
+        assert np.allclose(cached['height'][:, :25], 10) and np.allclose(cached['height'][:, 25:], 20)
+        assert 'facade_ijk' in cached.files
+
+
+def test_wall_fallback_with_no_voxel_in_reach():
+    """A compatible voxel in the corner of the fallback search box but farther than the reach:
+    the segment gets no colour (source 2) instead of an IndexError (seen on Espoo tile 471671x2)."""
+    from terrain_to_render import colour_segments
+    seg = {k: np.array([v]) for k, v in dict(xa=0., xb=0., ya=0., yb=2.5, z0=0., z1=2.5, nx=1., ny=0.).items()}
+    voxels = dict(ijk=np.array([[4, -5, -5]]), rgb=np.array([[200., 10., 10.]]), normal=np.array([[1., 0.]]),
+                  count=np.array([3.]))
+    rgb, source = colour_segments(seg, voxels, 1.0, 2.5)
+    assert source.tolist() == [2] and np.isnan(rgb).all()

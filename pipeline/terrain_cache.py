@@ -51,6 +51,7 @@ recreate missing lines from the .npz files present (download fields left null):
 import argparse
 import io
 import json
+import re
 import shutil
 import time
 import urllib.request
@@ -188,8 +189,14 @@ class TopViewRaster:
         valid = np.isfinite(z)
         count = valid.sum((1, 3))
         zsum = np.where(valid, z, 0.).sum((1, 3))
-        rgb = self.rgb.reshape(rows, factor, cols, factor, 3).astype(np.float64)
-        rgbsum = (rgb * valid[..., None]).sum((1, 3))
+        # Colour sums one sub-cell offset at a time (sums of integers, exact in float64, so the
+        # same values as a float64 sum over the whole array) to keep the peak memory low:
+        # a 2 km tile at 1 m with supersample 4 has 64 M sub-cells.
+        rgb = self.rgb.reshape(rows, factor, cols, factor, 3)
+        rgbsum = np.zeros((rows, cols, 3))
+        for i in range(factor):
+            for j in range(factor):
+                rgbsum += rgb[:, i, :, j] * valid[:, i, :, j, None]
         with np.errstate(invalid='ignore', divide='ignore'):
             height = (zsum / count).astype(np.float32)
             colour = np.rint(rgbsum / count[..., None])
@@ -315,96 +322,194 @@ class FacadeVoxels:
 
 # ----------------------------------------------------------------------------- OBJ reader
 
-def rasterise_obj_zip(archive_path, spacing, supersample, facade_voxel=None):
-    """Stream the OBJ inside a ZIP into a TopViewRaster; return the reduced grid.
+LOD_NODE = re.compile(r'^(?P<prefix>.+)_L(?P<level>\d+)(?:_(?P<path>\d+))?$')
+
+
+def mesh_objs(names, sizes):
+    """OBJ entries of an archive that together make the full-resolution mesh, sorted by name.
+
+    In a level-of-detail tree (ContextCapture naming <tile>_L<level>[_<path>].obj, where a child
+    node is one level down and adds one digit to its parent's path) only the leaves are kept,
+    the nodes without children; the tree structure counts empty files too. Every OBJ whose name
+    does not follow that pattern is kept. Empty files are skipped."""
+    objs = sorted(n for n in names if n.lower().endswith('.obj'))
+    nodes = {}
+    for name in objs:
+        match = LOD_NODE.match(name[:-4])
+        if match:
+            nodes[name] = (match['prefix'], int(match['level']), match['path'] or '')
+    parents = {(prefix, level - 1, path[:-1]) for prefix, level, path in nodes.values() if path}
+    return [n for n in objs if sizes[n] > 0 and (n not in nodes or nodes[n] not in parents)]
+
+
+def archive_origin(archive, names, origin):
+    """Offset to add to the OBJ vertices: the dataset's mesh_origin, or None when it is absent or
+    zero. A metadata.xml in the archive (ContextCapture) must declare the same SRSOrigin."""
+    declared = None if origin is None else np.asarray(origin, dtype=np.float64)
+    for name in names:
+        if Path(name).name.lower() != 'metadata.xml':
+            continue
+        match = re.search(r'<SRSOrigin>([^<]+)</SRSOrigin>', archive.read(name).decode(errors='replace'))
+        if match:
+            found = np.array([float(x) for x in match.group(1).split(',')])
+            if declared is None or found.shape != declared.shape or not np.allclose(found, declared):
+                raise ValueError(f'{name} declares SRSOrigin {found.tolist()}, the dataset mesh_origin is '
+                                 f'{None if declared is None else declared.tolist()}')
+    return declared if declared is not None and declared.any() else None
+
+
+def mtl_maps(archive, path):
+    """{material: texture file name} of one MTL in the archive."""
+    maps, material = {}, None
+    for line in archive.read(path).decode(errors='replace').splitlines():
+        if line.startswith('newmtl '):
+            material = line.split(maxsplit=1)[1].strip()
+        elif line.startswith('map_Kd ') and material is not None:
+            maps[material] = line.split(maxsplit=1)[1].strip()
+    return maps
+
+
+def raster_for(xmin, ymin, xmax, ymax, spacing, supersample):
+    """TopViewRaster on the dataset's global grid (corner at multiples of spacing) covering a box."""
+    x0 = np.floor(xmin / spacing) * spacing
+    y0 = np.floor(ymin / spacing) * spacing
+    cols = int(np.ceil((xmax - x0) / spacing))
+    rows = int(np.ceil((ymax - y0) / spacing))
+    return TopViewRaster(x0, y0, cols * supersample, rows * supersample, spacing / supersample)
+
+
+def vertex_bounds(archive, objs, offset):
+    """(xmin, ymin, xmax, ymax) of the vertices of several OBJs (one extra pass over the 'v' lines)."""
+    low, high = np.full(2, np.inf), np.full(2, -np.inf)
+    for obj in objs:
+        xy = []
+        with archive.open(obj) as raw:
+            for line in io.TextIOWrapper(raw, encoding='utf-8', errors='replace'):
+                if line.startswith('v '):
+                    xy.extend(map(float, line.split()[1:3]))
+        if xy:
+            xy = np.asarray(xy).reshape(-1, 2) + (0 if offset is None else offset[:2])
+            low, high = np.minimum(low, xy.min(0)), np.maximum(high, xy.max(0))
+    return (*low, *high)
+
+
+def rasterise_obj_zip(archive_path, spacing, supersample, facade_voxel=None, origin=None, bounds=None):
+    """Stream the OBJ files of a ZIP into one TopViewRaster; return the reduced grid.
+
+    The archive may hold one OBJ (Melbourne) or many: the leaves of a level-of-detail tree
+    (Helsinki) or a set of sub-tiles (Espoo), see mesh_objs. Each OBJ is read with the MTL of its
+    mtllib line (else the first MTL of the archive) and its texture paths are relative to its own
+    folder. origin (x, y, z) is added to every vertex (meshes in coordinates local to an origin).
+    bounds (xmin, ymin, xmax, ymax), e.g. the tile box from the dataset index, is the box rasterised
+    in a single pass (faces outside it are clipped), then cropped to the covered cells; without it
+    the grid covers the vertices (one extra pass when there are several OBJs).
 
     With facade_voxel (metres), the near-vertical faces are also sampled into FacadeVoxels in the
     same pass (same decoded texture), and the facade_* arrays are added to the result. The grid
     is computed exactly as without it.
     """
     with zipfile.ZipFile(archive_path) as archive:
-        names = archive.namelist()
-        obj = next(n for n in names if n.lower().endswith('.obj'))
-        mtl = next((n for n in names if n.lower().endswith('.mtl')), None)
-        folder = str(Path(obj).parent)
-        maps = {}
-        material = None
-        if mtl:
-            for line in archive.read(mtl).decode(errors='replace').splitlines():
-                if line.startswith('newmtl '):
-                    material = line.split(maxsplit=1)[1].strip()
-                elif line.startswith('map_Kd ') and material is not None:
-                    maps[material] = line.split(maxsplit=1)[1].strip()
-
-        def texture_path(name):
-            path = name if folder in ('', '.') else folder + '/' + name
-            return path if path in names else next((n for n in names if n.endswith('/' + name) or n == name), None)
-
-        vertices, uvs, fv, ft = [], [], [], []
-        v = uv = raster = None
-        material, image_cache = None, {}
-        faces = 0
+        infos = archive.infolist()
+        names = [info.filename for info in infos]
+        name_set = set(names)
+        objs = mesh_objs(names, {info.filename: info.file_size for info in infos})
+        if not objs:
+            raise ValueError(f'No OBJ in {archive_path}')
+        offset = archive_origin(archive, names, origin)
+        first_mtl = next((n for n in names if n.lower().endswith('.mtl')), None)
+        if bounds is None and len(objs) > 1:
+            bounds = vertex_bounds(archive, objs, offset)
+        raster = None if bounds is None else raster_for(*bounds, spacing, supersample)
         facades = FacadeVoxels(facade_voxel) if facade_voxel else None
+        faces = 0
+        image_cache = {}
 
-        def image_for(mat):
-            if mat not in image_cache:
+        def image_at(path):
+            if path not in image_cache:
                 image_cache.clear()  # keep one decoded atlas in memory at a time
-                path = texture_path(maps[mat]) if mat in maps else None
-                image_cache[mat] = None
+                image_cache[path] = None
                 if path:
                     with Image.open(io.BytesIO(archive.read(path))) as im:
-                        image_cache[mat] = np.asarray(im.convert('RGB'))
-            return image_cache[mat]
+                        image_cache[path] = np.asarray(im.convert('RGB'))
+            return image_cache[path]
 
-        def flush():
-            nonlocal faces
-            if not fv:
-                return
-            iv = np.asarray(fv, dtype=np.int64).reshape(-1, 3)
-            it = np.asarray(ft, dtype=np.int64).reshape(-1, 3)
-            tri_uv = uv[it] if len(uv) else np.zeros((len(iv), 3, 2))
-            image = image_for(material)
-            raster.add(v[iv], tri_uv, image)
-            if facades is not None:
-                facades.add(v[iv], tri_uv, image)
-            faces += len(iv)
-            fv.clear(); ft.clear()
+        for obj in objs:
+            folder = str(Path(obj).parent)
 
-        with archive.open(obj) as raw:
-            for line in io.TextIOWrapper(raw, encoding='utf-8', errors='replace'):
-                if line.startswith('v '):
-                    vertices.extend(map(float, line.split()[1:4]))
-                elif line.startswith('vt '):
-                    uvs.extend(map(float, line.split()[1:3]))
-                elif line.startswith(('f ', 'usemtl ')):
-                    if v is None:
-                        # Like the published photomeshes, all vertices precede the faces.
-                        v = np.asarray(vertices).reshape(-1, 3)
-                        uv = np.asarray(uvs).reshape(-1, 2)
-                        vertices = uvs = None
-                        x0 = np.floor(v[:, 0].min() / spacing) * spacing
-                        y0 = np.floor(v[:, 1].min() / spacing) * spacing
-                        cols = int(np.ceil((v[:, 0].max() - x0) / spacing))
-                        rows = int(np.ceil((v[:, 1].max() - y0) / spacing))
-                        raster = TopViewRaster(x0, y0, cols * supersample, rows * supersample,
-                                               spacing / supersample)
-                    if line.startswith('usemtl '):
-                        flush()
-                        material = line.split(maxsplit=1)[1].strip()
-                        continue
-                    fields = line.split()[1:]
-                    for k in range(1, len(fields) - 1):  # fan-triangulate polygons
-                        for field in (fields[0], fields[k], fields[k + 1]):
-                            parts = field.split('/')
-                            fv.append(int(parts[0]) - 1)
-                            ft.append(int(parts[1]) - 1 if len(parts) > 1 and parts[1] else 0)
-                    if len(fv) >= 3 * FACE_BATCH:
-                        flush()
+            def resolve(name, folder=folder):
+                path = name if folder in ('', '.') else folder + '/' + name
+                return path if path in name_set else next((n for n in names if n.endswith('/' + name) or n == name), None)
+
+            maps = None
+            vertices, uvs, fv, ft = [], [], [], []
+            v = uv = material = None
+
+            def flush():
+                nonlocal faces
+                if not fv:
+                    return
+                iv = np.asarray(fv, dtype=np.int64).reshape(-1, 3)
+                it = np.asarray(ft, dtype=np.int64).reshape(-1, 3)
+                tri_uv = uv[it] if len(uv) else np.zeros((len(iv), 3, 2))
+                image = image_at(resolve(maps[material]) if material in maps else None)
+                raster.add(v[iv], tri_uv, image)
+                if facades is not None:
+                    facades.add(v[iv], tri_uv, image)
+                faces += len(iv)
+                fv.clear(); ft.clear()
+
+            with archive.open(obj) as raw:
+                for line in io.TextIOWrapper(raw, encoding='utf-8', errors='replace'):
+                    if line.startswith('v '):
+                        vertices.extend(map(float, line.split()[1:4]))
+                    elif line.startswith('vt '):
+                        uvs.extend(map(float, line.split()[1:3]))
+                    elif line.startswith('mtllib ') and maps is None:
+                        path = resolve(line.split(maxsplit=1)[1].strip())
+                        if path:
+                            maps = mtl_maps(archive, path)
+                    elif line.startswith(('f ', 'usemtl ')):
+                        if v is None:
+                            # Like the published photomeshes, all vertices precede the faces.
+                            v = np.asarray(vertices).reshape(-1, 3)
+                            if offset is not None:
+                                v = v + offset
+                            uv = np.asarray(uvs).reshape(-1, 2)
+                            vertices = uvs = None
+                            if maps is None:
+                                maps = mtl_maps(archive, first_mtl) if first_mtl else {}
+                            if raster is None:
+                                raster = raster_for(v[:, 0].min(), v[:, 1].min(), v[:, 0].max(), v[:, 1].max(),
+                                                    spacing, supersample)
+                        if line.startswith('usemtl '):
+                            flush()
+                            material = line.split(maxsplit=1)[1].strip()
+                            continue
+                        fields = line.split()[1:]
+                        for k in range(1, len(fields) - 1):  # fan-triangulate polygons
+                            for field in (fields[0], fields[k], fields[k + 1]):
+                                parts = field.split('/')
+                                fv.append(int(parts[0]) - 1)
+                                ft.append(int(parts[1]) - 1 if len(parts) > 1 and parts[1] else 0)
+                        if len(fv) >= 3 * FACE_BATCH:
+                            flush()
+            if v is not None:
+                flush()
         if raster is None:
             raise ValueError(f'No faces in {archive_path}')
-        flush()
     height, rgb, coverage = raster.reduce(supersample)
-    result = dict(height=height, rgb=rgb, coverage=coverage, x0=raster.x0, y0=raster.y0, faces=faces)
+    x0, y0 = raster.x0, raster.y0
+    if bounds is not None:
+        # Crop the box to the covered cells, as a grid built from the vertices would be: the render
+        # grid fills empty cells from the nearest covered one, which must not spread over a tile
+        # that the mesh covers only in part (coast, edge of the dataset).
+        rows = np.flatnonzero(coverage.any(1))
+        cols = np.flatnonzero(coverage.any(0))
+        if len(rows):
+            r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+            height, rgb, coverage = height[r0:r1, c0:c1], rgb[r0:r1, c0:c1], coverage[r0:r1, c0:c1]
+            x0, y0 = x0 + c0 * spacing, y0 + r0 * spacing
+    result = dict(height=height, rgb=rgb, coverage=coverage, x0=x0, y0=y0, faces=faces, objs=len(objs))
     if facades is not None:
         result.update(facades.result())
     return result
@@ -446,25 +551,31 @@ def check_folder(output_dir, kind):
 # ----------------------------------------------------------------------------- one tile
 
 def process_tile(dataset_name, dataset, tile, output_dir, spacing, supersample, archives, keep,
-                 facade_voxel=None):
-    """Download (or reuse) one archive, rasterise it, write the cache, drop the archive."""
+                 facade_voxel=None, bounds=None):
+    """Download (or reuse) one archive, rasterise it, write the cache, drop the archive.
+
+    bounds (xmin, ymin, xmax, ymax) fixes the grid extent (dataset raster_bounds 'tile')."""
     start = time.monotonic()
     destination = output_dir / f'{tile}.npz'
-    local = archives / f'{tile}.zip' if archives else None
-    if local is not None and local.exists():
+    url = dataset['url'].format(tile=tile)
+    local = None
+    if archives:  # an already downloaded archive: <tile>.zip or the file name of its URL
+        names = (f'{tile}.zip', url.rsplit('/', 1)[-1].split('?', 1)[0])
+        local = next((archives / n for n in names if (archives / n).exists()), None)
+    if local is not None:
         archive, downloaded, owned = local, 0, False
     else:
         archive = output_dir / 'downloads' / f'{tile}.zip'
         archive.parent.mkdir(exist_ok=True)
-        downloaded = download(dataset['url'].format(tile=tile), archive)
+        downloaded = download(url, archive)
         owned = True
     archive_bytes = archive.stat().st_size
     t_download = time.monotonic() - start
     try:
+        extra = dict(origin=dataset.get('mesh_origin'), bounds=bounds)
         if facade_voxel:
-            grid = READERS[dataset['format']](archive, spacing, supersample, facade_voxel=facade_voxel)
-        else:
-            grid = READERS[dataset['format']](archive, spacing, supersample)
+            extra['facade_voxel'] = facade_voxel
+        grid = READERS[dataset['format']](archive, spacing, supersample, **extra)
     finally:
         if owned and not keep:
             archive.unlink(missing_ok=True)
@@ -476,7 +587,7 @@ def process_tile(dataset_name, dataset, tile, output_dir, spacing, supersample, 
                             epsg=dataset['projected_epsg'], dataset=dataset_name, tile=tile, **facade)
     temporary.replace(destination)
     valid = np.isfinite(grid['height'])
-    record = dict(tile=tile, shape=list(grid['height'].shape), faces=grid['faces'],
+    record = dict(tile=tile, shape=list(grid['height'].shape), faces=grid['faces'], objs=grid.get('objs'),
                   covered_fraction=float(valid.mean()), archive_bytes=archive_bytes,
                   downloaded_bytes=downloaded, cache_bytes=destination.stat().st_size,
                   download_s=round(t_download, 1), total_s=round(time.monotonic() - start, 1))
@@ -492,9 +603,31 @@ def process_tile(dataset_name, dataset, tile, output_dir, spacing, supersample, 
 
 # ----------------------------------------------------------------------------- tile selection
 
+def grid_index(spec):
+    """{tile_id: square polygon (5, 2)} of an index of type 'grid': the ids in spec['tiles'] name the
+    south-west corner, x = x_origin_m + id_unit_m * <x>, y = y_origin_m + id_unit_m * <y>, with <x>
+    and <y> the named groups of id_regex; each tile is tile_size_m on a side."""
+    pattern, size, unit = re.compile(spec['id_regex']), spec['tile_size_m'], spec['id_unit_m']
+    index = {}
+    for tile in spec['tiles']:
+        match = pattern.match(tile)
+        if not match:
+            raise ValueError(f'tile id {tile!r} does not match {spec["id_regex"]}')
+        x = spec['x_origin_m'] + unit * int(match['x'])
+        y = spec['y_origin_m'] + unit * int(match['y'])
+        index[tile] = np.array([[x, y], [x + size, y], [x + size, y + size], [x, y + size], [x, y]], dtype=np.float64)
+    return index
+
+
 def tile_index(dataset, root=REPO):
-    """Return {tile_id: polygon (n,2) in the projected CRS} from the dataset index."""
+    """Return {tile_id: polygon (n,2) in the projected CRS} from the dataset index.
+
+    Index types: 'arcgis' (ArcGIS JSON query with polygon geometry.rings and the id in
+    attributes[id_field]; local_copy is used instead of the url when present, and written after a
+    download) and 'grid' (regular square tiles listed in the entry, see grid_index)."""
     spec = dataset['index']
+    if spec.get('type') == 'grid':
+        return grid_index(spec)
     path = root / spec['local_copy'] if spec.get('local_copy') else None
     if path is not None and path.exists():
         payload = json.loads(path.read_text())
@@ -506,6 +639,15 @@ def tile_index(dataset, root=REPO):
             path.write_text(json.dumps(payload))
     return {f['attributes'][spec['id_field']]: np.asarray(f['geometry']['rings'][0])
             for f in payload['features']}
+
+
+def tile_bounds(dataset, tiles):
+    """{tile: (xmin, ymin, xmax, ymax)} of the index polygons when the dataset's raster_bounds is
+    'tile' (archives of several OBJs cut at the tile edges), else {} (grid from the vertices)."""
+    if dataset.get('raster_bounds', 'vertices') != 'tile':
+        return {}
+    index = tile_index(dataset)
+    return {t: tuple(float(c) for c in (*index[t].min(0), *index[t].max(0))) for t in tiles}
 
 
 def describe_dataset(name, dataset, dataset_dir, root=REPO):
@@ -522,7 +664,11 @@ def describe_dataset(name, dataset, dataset_dir, root=REPO):
     spec = dataset.get('index', {})
     local = root / spec['local_copy'] if spec.get('local_copy') else None
     try:
-        if local is not None and local.exists():
+        if spec.get('type') == 'grid':  # same layout as an ArcGIS query, attribute 'tile'
+            features = [dict(attributes=dict(tile=t), geometry=dict(rings=[ring.tolist()]))
+                        for t, ring in grid_index(spec).items()]
+            grid.write_text(json.dumps(dict(features=features)))
+        elif local is not None and local.exists():
             shutil.copyfile(local, grid)
         elif spec.get('url'):
             download(spec['url'], grid)
@@ -661,10 +807,11 @@ def main():
     describe_dataset(args.dataset, dataset, args.output / args.dataset)
     log = output_dir / 'log.jsonl'
     failures = []
+    bounds = tile_bounds(dataset, todo)
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         jobs = {pool.submit(process_tile, args.dataset, dataset, t, output_dir, args.spacing,
                             args.supersample, args.archives, args.keep_archives,
-                            facade_voxel): t for t in todo}
+                            facade_voxel, bounds.get(t)): t for t in todo}
         for job in as_completed(jobs):  # log each tile when it completes, so an interrupted run loses no record
             tile = jobs[job]
             try:

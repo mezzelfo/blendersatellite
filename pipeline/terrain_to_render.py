@@ -297,6 +297,8 @@ def colour_segments(seg, voxels, voxel_size, spacing, max_angle_deg=WALL_MAX_ANG
             d = np.hypot(hd, dz)
             ok = d <= reach + 1e-9
             local, vid, d = local[ok], vid[ok], d[ok]
+            if not len(local):  # no voxel within reach in this batch
+                continue
             # Per segment: smallest distance, ties to the smallest voxel key (deterministic).
             o = np.lexsort((keys[vid], d, local))
             local, vid, d = local[o], vid[o], d[o]
