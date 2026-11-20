@@ -653,3 +653,48 @@ def test_wall_fallback_with_no_voxel_in_reach():
                   count=np.array([3.]))
     rgb, source = colour_segments(seg, voxels, 1.0, 2.5)
     assert source.tolist() == [2] and np.isnan(rgb).all()
+
+
+# ----------------------------------------------------------------------------- truncated archives
+
+def truncate_with_zeros(path, keep):
+    """Keep the first `keep` bytes and zero the rest, keeping the size (as the broken Helsinki files)."""
+    data = path.read_bytes()
+    path.write_bytes(data[:keep] + bytes(len(data) - keep))
+
+
+def test_truncated_archive_is_read_entry_by_entry(tmp_path):
+    path = tmp_path / 'T.zip'
+    lod_tree_zip(path)
+    with zipfile.ZipFile(path, 'a', zipfile.ZIP_DEFLATED) as archive:   # a last entry to be cut
+        add_node(archive, 'sub2', 'Tile_+001_+000_L13', 'red', (0., 100., 50., 100., 99.))
+    with zipfile.ZipFile(path) as archive:
+        last = archive.getinfo('sub2/Tile_+001_+000_L13_0.png')
+        whole = {n: archive.read(n) for n in archive.namelist()}
+    truncate_with_zeros(path, last.header_offset + 40)       # cut inside the last local header's data
+    with pytest.raises(zipfile.BadZipFile):
+        zipfile.ZipFile(path)
+    with tc.open_archive(path) as archive:
+        assert isinstance(archive, tc.SequentialZip)
+        names = archive.namelist()
+        assert 'sub2/Tile_+001_+000_L13_0.png' not in names and 'sub2/Tile_+001_+000_L13.obj' in names
+        assert all(archive.read(n) == whole[n] for n in names)
+    x0, y0 = GK_ORIGIN[:2]
+    grid = tc.rasterise_obj_zip(path, 1.0, 2, origin=GK_ORIGIN, bounds=(x0, y0, x0 + 100, y0 + 100))
+    assert grid['recovered_entries'] == len(names) and grid['objs'] == 3
+    # the recovered sub-tile has no texture (cut), the tree of the first one is read as before
+    assert np.allclose(grid['height'][:50, :50], 10) and np.allclose(grid['height'][:50, 50:], 20)
+    assert np.allclose(grid['height'][50:], 99)
+
+
+def test_intact_archive_keeps_its_last_entry():
+    """Walking an intact archive stops at the central directory and keeps the last entry."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr('a.txt', 'first ' * 100)
+        archive.writestr('b.txt', 'second ' * 100)
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.zip') as f:
+        f.write(buffer.getvalue()); f.flush()
+        with tc.SequentialZip(f.name) as archive:
+            assert archive.namelist() == ['a.txt', 'b.txt'] and archive.read('b.txt') == b'second ' * 100

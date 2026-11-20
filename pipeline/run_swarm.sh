@@ -109,6 +109,11 @@ TERRAIN_CACHE_DIR="$PROJECT_DIR/data/terrain/$DATASET/$(conda run -n orbits pyth
 conda run --no-capture-output -n orbits python "$PROJECT_DIR/pipeline/terrain_cache.py" \
     --dataset "$DATASET" --tiles-from "$ORBITS_RUN_DIR/cameras.json" \
     --spacing "$TERRAIN_SPACING" --workers "${TERRAIN_WORKERS:-4}" ${ARCHIVE_OPTS[@]+"${ARCHIVE_OPTS[@]}"}
+# Composite dataset (members in terrain_datasets.json): fit the correction of the members towards the
+# first one on their shared area, once (data/terrain/$DATASET/<spacing>m/correction.json); no-op otherwise.
+conda run --no-capture-output -n orbits python "$PROJECT_DIR/pipeline/terrain_merge.py" \
+    --dataset "$DATASET" --spacing "$TERRAIN_SPACING" --ensure --workers "${TERRAIN_WORKERS:-4}" \
+    ${ARCHIVE_OPTS[@]+"${ARCHIVE_OPTS[@]}"}
 conda run --no-capture-output -n orbits python "$PROJECT_DIR/pipeline/terrain_to_render.py" \
     --cameras "$ORBITS_RUN_DIR/cameras.json" \
     --cache "$TERRAIN_CACHE_DIR" --dataset "$DATASET" ${WALL_OPTS[@]+"${WALL_OPTS[@]}"}

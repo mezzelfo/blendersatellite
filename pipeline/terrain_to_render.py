@@ -28,6 +28,16 @@ the tile holding its west or south cell. Extra keys in the render .npz (grid key
                  from the nearest voxel, from the lower cell)
 Renders with and without walls must not be mixed: cache_frame.json records the wall settings,
 so --walls refuses an output folder made without them and the reverse.
+
+A composite dataset (terrain_merge.py) is given with --cache <root>/<composite>/<spacing>m, the
+folder of its correction.json; the members' caches are its siblings <root>/<member>/<spacing>m.
+Every member's tiles of the run are converted, as <member>__<tile>.npz. The members after the
+first get the height and colour correction of correction.json (render grids and facade voxels).
+In a render cell where several members have data the first member in priority order wins: the
+other members' faces there are dropped through the key face_keep (rows - 1, cols - 1) bool, true
+for the grid quads to draw (see composite_keep), and the walls follow the same ownership.
+
+tiles.json in the output folder lists the converted tiles (render_swarm.py loads those).
 """
 import argparse
 import json
@@ -39,6 +49,7 @@ from pyproj import Transformer
 from scipy.ndimage import distance_transform_edt
 
 from terrain_cache import load_datasets, run_tiles
+from terrain_merge import composite_members, load_corrections, member_cache_dirs, model_digest
 
 
 def _axis_overlap(start, spacing, count, target):
@@ -97,14 +108,18 @@ def bin_to_spacing(height, rgb, coverage, x0, y0, spacing, target, return_weight
 
 # ----------------------------------------------------------------------------- render grid
 
-def render_grid(cache_path, target):
+def render_grid(cache_path, target, correction=None):
     """Render grid of one cached tile in its native CRS: binned to target, empty cells filled
     from the nearest filled cell. Returns height, rgb, weight (binned coverage, 0 on filled
-    cells), x0, y0, global cell indices i0 = x0 / target, j0 = y0 / target, sampled_fraction."""
+    cells), x0, y0, global cell indices i0 = x0 / target, j0 = y0 / target, sampled_fraction.
+    correction (terrain_merge.MemberCorrection) corrects the binned heights and colours first."""
     with np.load(cache_path) as data:
         h, rgb, x0, y0, weight = bin_to_spacing(data['height'], data['rgb'], data['coverage'],
                                                 float(data['x0']), float(data['y0']), float(data['spacing']),
                                                 target, return_weight=True)
+    if correction is not None:
+        rows, cols = h.shape
+        h, rgb = correction.grid(h, rgb, x0 + (np.arange(cols) + .5) * target, y0 + (np.arange(rows) + .5) * target)
     valid = np.isfinite(h)
     if not valid.any():
         raise ValueError(f'No covered cells in {cache_path}')
@@ -130,6 +145,7 @@ WALL_MAX_ANGLE_DEG = 60.       # voxel normal vs wall outward normal
 WALL_FALLBACK_CELLS = 2.       # nearest-voxel fallback radius, in render cells
 SOURCES = ('voxels', 'nearest_voxel', 'lower_cell', 'lower_cell_small_step')
 MAX_CANDIDATES_WALL = 4_000_000
+RANK_BONUS = 1e6               # composite ownership: added per priority level to cells with data
 
 
 def merged_window(tile, grids, pad=1):
@@ -162,8 +178,11 @@ def merged_window(tile, grids, pad=1):
         r0, r1 = max(j0, n['j0']), min(j0 + n_rows, n['j0'] + nr)
         win = (slice(r0 - j0, r1 - j0), slice(c0 - i0, c1 - i0))
         src = (slice(r0 - n['j0'], r1 - n['j0']), slice(c0 - n['i0'], c1 - n['i0']))
-        better = n['weight'][src] > weight[win]
-        weight[win] = np.where(better, n['weight'][src], weight[win])
+        score = n['weight'][src]
+        if 'rank' in n:  # composite: cells with data of a higher-priority member always win
+            score = np.where(score > 0, score + RANK_BONUS * (n['n_ranks'] - n['rank']), score)
+        better = score > weight[win]
+        weight[win] = np.where(better, score, weight[win])
         owner[win] = np.where(better, k, owner[win])
         height[win] = np.where(better, n['height'][src], height[win])
         rgb[win] = np.where(better[..., None], n['rgb'][src], rgb[win])
@@ -415,9 +434,44 @@ def facade_loader(cache_dir, maxsize=32):
     return load
 
 
+def composite_keep(name, grids):
+    """Cells (rows, cols) bool of tile name to draw in a composite terrain.
+
+    A cell is drawn when its member has data there (binned weight > 0) and no higher-priority
+    member does, or when no member has data there and no higher-priority member's grid holds the
+    cell (the nearest-cell fill is drawn once). grids: render grids with keys member and rank."""
+    g = grids[name]
+    rows, cols = g['height'].shape
+    own = g['weight'] > 0
+    higher_data = np.zeros((rows, cols), bool)
+    higher_holds = np.zeros((rows, cols), bool)
+    other_data = np.zeros((rows, cols), bool)
+    for other, n in grids.items():
+        if n['member'] == g['member']:
+            continue
+        nr, nc = n['height'].shape
+        c0, c1 = max(g['i0'], n['i0']), min(g['i0'] + cols, n['i0'] + nc)
+        r0, r1 = max(g['j0'], n['j0']), min(g['j0'] + rows, n['j0'] + nr)
+        if c1 <= c0 or r1 <= r0:
+            continue
+        mine = (slice(r0 - g['j0'], r1 - g['j0']), slice(c0 - g['i0'], c1 - g['i0']))
+        data = n['weight'][r0 - n['j0']:r1 - n['j0'], c0 - n['i0']:c1 - n['i0']] > 0
+        other_data[mine] |= data
+        if n['rank'] < g['rank']:
+            higher_data[mine] |= data
+            higher_holds[mine] = True
+    return (own & ~higher_data) | (~own & ~other_data & ~higher_holds)
+
+
+def face_keep_of(keep):
+    """Grid quads (rows - 1, cols - 1) to draw: those with at least one drawn corner cell, so the
+    surfaces of two members meet without a gap (they overlap by at most one cell)."""
+    return keep[:-1, :-1] | keep[1:, :-1] | keep[:-1, 1:] | keep[1:, 1:]
+
+
 # ----------------------------------------------------------------------------- output
 
-def convert_tile(grid, output, manifest, dataset, target, walls=None):
+def convert_tile(grid, output, manifest, dataset, target, walls=None, face_keep=None):
     """Write the render .npz of one tile from its render_grid (and build_walls result)."""
     h, rgb = grid['height'], grid['rgb']
     rows, cols = h.shape
@@ -430,6 +484,8 @@ def convert_tile(grid, output, manifest, dataset, target, walls=None):
         extra = dict(wall_vertices=to_local(walls['quads'].reshape(-1, 3), manifest, dataset).astype(np.float32),
                      wall_rgb=np.repeat(walls['rgb'], 4, axis=0), wall_segments=n, wall_edges=walls['edges'],
                      wall_sources=np.array(SOURCES), wall_source_counts=counts)
+    if face_keep is not None:
+        extra['face_keep'] = face_keep
     temporary = output.with_suffix('.npz.part')
     with temporary.open('wb') as stream:
         np.savez_compressed(stream, vertices=local.astype(np.float32), rgb=rgb.reshape(-1, 3),
@@ -463,41 +519,71 @@ def main():
                         help='height difference (m) between adjacent render cells above which a wall is built')
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--dry-run', action='store_true', help='report what would be converted, write nothing')
+    parser.add_argument('--datasets', type=Path, help='terrain_datasets.json to use (default: the repository one)')
     args = parser.parse_args()
 
     if args.output is None:
         args.output = args.cameras.resolve().parent.parent / 'terrain_render'
     manifest = json.loads(args.cameras.read_text())
-    dataset = load_datasets()[args.dataset]
+    datasets = load_datasets(args.datasets) if args.datasets else load_datasets()
+    members = composite_members(datasets, args.dataset)
     target = args.spacing or manifest['mesh_grid_spacing_m']
     frame = {k: manifest[k] for k in ('origin_ecef_m', 'local_from_ecef')}
     frame['mesh_grid_spacing_m'] = target
     if args.walls:  # renders with and without walls must not share an output folder
         frame['walls'] = dict(threshold_m=args.wall_threshold, max_angle_deg=WALL_MAX_ANGLE_DEG,
                               fallback_cells=WALL_FALLBACK_CELLS)
+    corrections = {}
+    if members:  # composite: one entry per member tile, member caches beside the composite folder
+        caches = member_cache_dirs(args.cache, members)
+        model, corrections = load_corrections(args.cache, datasets, args.dataset)
+        frame['composite'] = dict(members=members, correction=model_digest(model))
+        entries = [(f'{m}__{t}', m, t, caches[m]) for m in members for t in run_tiles(datasets[m], manifest)]
+    else:
+        entries = [(t, args.dataset, t, args.cache) for t in run_tiles(datasets[args.dataset], manifest)]
+    rank = {m: k for k, m in enumerate(members or [args.dataset])}
     frame_path = args.output / 'cache_frame.json'
     if frame_path.exists() and json.loads(frame_path.read_text()) != frame:
-        raise ValueError('Frame, spacing or wall settings differ from the existing output; use a new output directory')
+        raise ValueError('Frame, spacing, wall settings or composite correction differ from the existing output; '
+                         'use a new output directory')
     if not args.dry_run:
         args.output.mkdir(parents=True, exist_ok=True)
         frame_path.write_text(json.dumps(frame, indent=2) + '\n')
-    tiles = run_tiles(dataset, manifest)
-    missing = [t for t in tiles if not (args.cache / f'{t}.npz').exists()]
-    todo = [t for t in tiles if t not in missing and (args.force or not (args.output / f'{t}.npz').exists())]
+    where = {out: (m, t, c) for out, m, t, c in entries}
+    missing = [out for out, m, t, c in entries if not (c / f'{t}.npz').exists()]
+    todo = [out for out, m, t, c in entries
+            if out not in missing and (args.force or not (args.output / f'{out}.npz').exists())]
     grids = {}
-    if args.walls and todo and not args.dry_run:
-        # Walls need the neighbours' grids (halo) and voxels: build every available grid first.
-        grids = {t: render_grid(args.cache / f'{t}.npz', target) for t in tiles if t not in missing}
-        load_voxels = facade_loader(args.cache)
+    if (args.walls or members) and todo and not args.dry_run:
+        # Walls need the neighbours' grids (halo) and voxels, a composite the other members' grids:
+        # build every available grid first.
+        for out, (m, t, c) in where.items():
+            if out in missing:
+                continue
+            grids[out] = render_grid(c / f'{t}.npz', target, corrections.get(m))
+            if members:
+                grids[out].update(member=m, rank=rank[m], n_ranks=len(members))
+        if members:
+            loaders = {m: facade_loader(caches[m]) for m in members}
+
+            def load_voxels(out):
+                m, t, _ = where[out]
+                voxels = loaders[m](t)
+                return corrections[m].voxels(voxels) if m in corrections else voxels
+        else:
+            load_voxels = facade_loader(args.cache)
     done, kept, vertices, triangles, wall_triangles = 0, 0, 0, 0, 0
     sources = np.zeros(len(SOURCES), dtype=np.int64)
-    for tile in tiles:
-        if tile in missing:
+    for out, m, t, c in entries:
+        if out in missing:
             continue
-        source, destination = args.cache / f'{tile}.npz', args.output / f'{tile}.npz'
-        if tile not in todo:
+        source, destination = c / f'{t}.npz', args.output / f'{out}.npz'
+        quads = None
+        if out not in todo:
             with np.load(destination) as data:  # already converted: count what the renderer will load
                 rows, cols = (int(n) for n in data['shape'])
+                if 'face_keep' in data.files:
+                    quads = int(data['face_keep'].sum())
                 if 'wall_segments' in data.files:
                     wall_triangles += 2 * int(data['wall_segments'])
                     sources += data['wall_source_counts']
@@ -506,18 +592,26 @@ def main():
             rows, cols = binned_shape(source, target)
             done += 1
         else:
-            grid = grids[tile] if grids else render_grid(source, target)
-            walls = build_walls(tile, grids, load_voxels, target, args.wall_threshold) if args.walls else None
-            rows, cols = convert_tile(grid, destination, manifest, dataset, target, walls)
+            grid = grids[out] if grids else render_grid(source, target)
+            walls = build_walls(out, grids, load_voxels, target, args.wall_threshold) if args.walls else None
+            face_keep = face_keep_of(composite_keep(out, grids)) if members else None
+            rows, cols = convert_tile(grid, destination, manifest, datasets[m], target, walls, face_keep)
+            if face_keep is not None:
+                quads = int(face_keep.sum())
+                print(f'{out}: {quads:,} of {face_keep.size:,} grid quads drawn', flush=True)
             if walls is not None:
                 wall_triangles += 2 * len(walls['quads'])
                 sources += np.bincount(walls['source'], minlength=len(SOURCES))
-                print(f'{tile}: {walls["edges"]:,} wall edges, {len(walls["quads"]):,} segments '
+                print(f'{out}: {walls["edges"]:,} wall edges, {len(walls["quads"]):,} segments '
                       f'({", ".join(f"{n} {k}" for k, n in zip(SOURCES, np.bincount(walls["source"], minlength=len(SOURCES))))})',
                       flush=True)
             done += 1
         vertices += rows * cols
-        triangles += 2 * (rows - 1) * (cols - 1)  # two per grid cell, as render_swarm.py builds them
+        # two triangles per drawn grid quad, as render_swarm.py builds them
+        triangles += 2 * (quads if quads is not None else (rows - 1) * (cols - 1))
+    if not args.dry_run:
+        present = [out for out, *_ in entries if out not in missing]
+        (args.output / 'tiles.json').write_text(json.dumps(dict(dataset=args.dataset, tiles=present), indent=1) + '\n')
     print(f'{"would convert" if args.dry_run else "converted"} {done} tiles at {target:g} m, '
           f'{kept} already present; {done + kept} tiles, {vertices:,} vertices, '
           f'{triangles:,} triangles -> {args.output}')

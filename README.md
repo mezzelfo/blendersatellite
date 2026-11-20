@@ -177,6 +177,34 @@ Datasets in `terrain_datasets.json`: `melbourne_2020` (570 tiles, 113.7 GB), `he
 (122 tiles of 2 km, 190.4 GB, levels L13-L21, leaves at L21, origin 25490000, 6668000) and
 `espoo_2017` (Espoo and Kauniainen, 140 tiles of 2 km, 75.9 GB, origin 25481691, 6680412), both
 in EPSG:3879. The Finnish datasets have no `target` yet, which `pipeline/run_swarm.sh` needs.
+
+Truncated archives: 17 of the 122 Helsinki ZIPs on the server are cut (their tail is zero bytes,
+no central directory; checked on 2026-11-20, about 22 GB and up to 35 km2 of 250 m sub-tiles
+missing). `terrain_cache.py` reads such an archive entry by entry from its local headers
+(`SequentialZip`), keeps the entries followed by a valid header (the cut one is left out) and
+logs `recovered_entries` for the tile; the sub-tiles after the cut stay empty.
+
+#### Composite terrain (adjacent datasets)
+
+A composite entry lists datasets in priority order, e.g. `helsinki_espoo_2017` with
+`"members": ["helsinki_2017", "espoo_2017"]`; run it with `DATASET=helsinki_espoo_2017`.
+The members keep their own caches; `terrain_cache.py --dataset <composite>` caches each member's
+tiles. `pipeline/terrain_merge.py` fits, on the cells a member shares with the first member, a
+correction of that member towards the first one and writes
+`data/terrain/<composite>/<spacing>m/correction.json` (`run_swarm.sh` calls it with `--ensure`,
+which also caches the shared-area tiles the first time):
+
+- height: median of the height difference on flat cells per 250 m block, interpolated between
+  blocks, in full near the shared area and tapered to zero over 2 km beyond it (the offsets
+  measured between Helsinki and Espoo are local: -0.4 to +1.9 m within a few km);
+- colour: per channel gain and offset matching mean and standard deviation (Espoo is about
+  10 DN brighter and bluer than Helsinki), applied to the whole member.
+
+`terrain_to_render.py` converts every member's tiles as `<member>__<tile>.npz`, applies the
+correction to grids and facade voxels, and where several members have data in a cell keeps the
+first member: the other members' grid quads there are dropped through the key `face_keep`, and
+the walls follow the same ownership. Every conversion also writes `tiles.json` (the converted
+tiles), which `render_swarm.py` loads (runs older than this list them in `cameras.json`).
 - `description`, `license`: copied to `dataset.json`.
 
 Renders made with this terrain differ in colour from `eevee_full_1000` (cell mean
@@ -479,7 +507,7 @@ Orbit-driven swarm pipeline:
 
 - `terrain_datasets.json`: terrain datasets (download URL, CRS, tile index, target point).
 - `pipeline/`: the pipeline. Entry point: `run_swarm.sh` (orbit simulation, terrain download and
-  conversion, rendering). Terrain: `terrain_cache.py` (downloads and caches the mesh tiles),
+  conversion, rendering). Composite terrains: `terrain_merge.py`. Terrain: `terrain_cache.py` (downloads and caches the mesh tiles),
   `terrain_to_render.py` (render grids in the run's local frame). Rendering: `render_swarm.py` (Blender),
   `render_pool.py` (workers on every GPU), `render_to_raw.py` (raw mode), `vulkan_gpu_probe.py`.
   Cubes: `build_cubes.py`, `cube_stacking.py`, `stacking_geometry.py`, `export_cube_band_samples.py`.

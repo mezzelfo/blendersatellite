@@ -219,7 +219,10 @@ def main():
     # Emission preserves the captured aerial texture illumination. This MVP
     # validates geometry/poses and does not infer illumination from orbit time.
     missing=[];triangles=0
-    for tile in ([] if args.check_only else manifest['selected_tiles']):
+    # Tiles converted by terrain_to_render.py (tiles.json); older runs list them in cameras.json.
+    tiles_json=args.terrain/'tiles.json'
+    terrain_tiles=json.loads(tiles_json.read_text())['tiles'] if tiles_json.exists() else manifest.get('selected_tiles',[])
+    for tile in ([] if args.check_only else terrain_tiles):
         path=args.terrain/(tile+'.npz')
         if not path.exists(): missing.append(tile);continue
         with np.load(path) as data:
@@ -227,8 +230,11 @@ def main():
             rows,cols=data['shape']
             # Optional walls (terrain_to_render.py --walls): 4 corners per segment, same colour handling.
             walls=(data['wall_vertices'],data['wall_rgb'].astype(float)/255) if 'wall_vertices' in data.files else None
+            # Composite terrain: grid quads of this tile to draw (cells of a higher-priority dataset dropped).
+            face_keep=data['face_keep'].ravel() if 'face_keep' in data.files else None
         ids=np.arange(rows*cols).reshape(rows,cols)
         a=ids[:-1,:-1].ravel();b=a+1;c=a+cols;d=c+1
+        if face_keep is not None: a,b,c,d=a[face_keep],b[face_keep],c[face_keep],d[face_keep]
         faces=np.concatenate([np.stack([a,b,d],1),np.stack([a,d,c],1)])
         meshes=[(tile,vertices,faces,rgb)]
         if walls is not None and len(walls[0]):
@@ -256,7 +262,7 @@ def main():
     report_path=args.output/'render_report.jsonl'
     header=dict(type='run',cameras=str(args.cameras.resolve()),frames=args.frames,
                 satellites=sorted(selected),pointing_mode=manifest.get('pointing_mode','nadir'),
-                target_source=manifest.get('target_source'),terrain_tiles=len(manifest['selected_tiles']),
+                target_source=manifest.get('target_source'),terrain_tiles=len(terrain_tiles),
                 triangles=triangles,samples=args.samples,compute_device=scene.cycles.device,
                 gpu_backend=args.gpu_backend,gpu_devices=gpu_devices,denoising=False,
                 coverage_every=args.coverage_every,png_compression=args.png_compression,crops=args.crop,blender_version=bpy.app.version_string,

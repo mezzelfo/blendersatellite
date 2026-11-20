@@ -51,11 +51,15 @@ recreate missing lines from the .npz files present (download fields left null):
 import argparse
 import io
 import json
+import os
 import re
 import shutil
+import struct
 import time
 import urllib.request
 import zipfile
+import zlib
+from types import SimpleNamespace
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -95,6 +99,97 @@ def download(url, destination, retries=3, chunk=1 << 20):
                 raise RuntimeError(f'download failed after {retries} attempts: {url}: '
                                    f'{type(error).__name__}: {error}') from error
             time.sleep(5 * attempt)
+
+
+# ----------------------------------------------------------------------------- truncated archives
+
+class SequentialZip:
+    """Read-only view of a ZIP whose central directory is lost (an interrupted upload or download:
+    the file is cut or its tail is zero bytes). The entries are found by walking the local file
+    headers from the start of the file. An entry is kept only when a valid local header (or the
+    central directory) follows it, so the entry cut by the truncation is left out; each read is
+    checked against the CRC of its header. Entries must be stored or deflated and carry their
+    sizes in the local header (no data descriptor). Same reading API as zipfile.ZipFile for what
+    rasterise_obj_zip uses: infolist, namelist, read, open."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.fp = open(self.path, 'rb')
+        size = os.fstat(self.fp.fileno()).st_size
+        self.entries, pending, offset = {}, None, 0
+        while offset + 30 <= size:
+            self.fp.seek(offset)
+            head = self.fp.read(30)
+            if head[:4] == b'PK\x01\x02' and pending:  # central directory: the last entry is whole
+                self.entries[pending[0]] = pending[1]
+                pending = None
+            if head[:4] != b'PK\x03\x04':
+                break
+            _, _, flags, method, _, _, crc, csize, usize, nlen, xlen = struct.unpack('<IHHHHHIIIHH', head)
+            name = self.fp.read(nlen).decode('utf-8' if flags & 0x800 else 'cp437')
+            extra = self.fp.read(xlen)
+            if 0xFFFFFFFF in (csize, usize):  # ZIP64 extra field: sizes stored there
+                at = 0
+                while at + 4 <= len(extra):
+                    tag, length = struct.unpack('<HH', extra[at:at + 4])
+                    if tag == 1:
+                        values = list(struct.unpack(f'<{length // 8}Q', extra[at + 4:at + 4 + 8 * (length // 8)]))
+                        if usize == 0xFFFFFFFF:
+                            usize = values.pop(0)
+                        if csize == 0xFFFFFFFF:
+                            csize = values.pop(0)
+                    at += 4 + length
+            if flags & 0x8:
+                raise zipfile.BadZipFile(f'{self.path}: entries with a data descriptor cannot be recovered')
+            if pending:  # a valid header follows the previous entry: it is whole
+                self.entries[pending[0]] = pending[1]
+            data = offset + 30 + nlen + xlen
+            pending = (name, SimpleNamespace(filename=name, file_size=usize, offset=data, csize=csize,
+                                             method=method, crc=crc))
+            offset = data + csize
+        self.recovered_bytes = min(offset, size)
+
+    def infolist(self):
+        return list(self.entries.values())
+
+    def namelist(self):
+        return list(self.entries)
+
+    def read(self, name):
+        entry = self.entries[name]
+        self.fp.seek(entry.offset)
+        data = self.fp.read(entry.csize)
+        if entry.method == 8:
+            data = zlib.decompress(data, -15)
+        elif entry.method != 0:
+            raise zipfile.BadZipFile(f'{name}: compression method {entry.method} not supported')
+        if zlib.crc32(data) != entry.crc:
+            raise zipfile.BadZipFile(f'{name}: CRC mismatch')
+        return data
+
+    def open(self, name):
+        return io.BytesIO(self.read(name))
+
+    def close(self):
+        self.fp.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def open_archive(path):
+    """zipfile.ZipFile, or a SequentialZip of the whole entries when the central directory is lost."""
+    try:
+        return zipfile.ZipFile(path)
+    except zipfile.BadZipFile:
+        archive = SequentialZip(path)
+        if not archive.entries:
+            archive.close()
+            raise
+        return archive
 
 
 # ----------------------------------------------------------------------------- rasteriser
@@ -408,7 +503,8 @@ def rasterise_obj_zip(archive_path, spacing, supersample, facade_voxel=None, ori
     same pass (same decoded texture), and the facade_* arrays are added to the result. The grid
     is computed exactly as without it.
     """
-    with zipfile.ZipFile(archive_path) as archive:
+    with open_archive(archive_path) as archive:
+        recovered = isinstance(archive, SequentialZip)
         infos = archive.infolist()
         names = [info.filename for info in infos]
         name_set = set(names)
@@ -510,6 +606,8 @@ def rasterise_obj_zip(archive_path, spacing, supersample, facade_voxel=None, ori
             height, rgb, coverage = height[r0:r1, c0:c1], rgb[r0:r1, c0:c1], coverage[r0:r1, c0:c1]
             x0, y0 = x0 + c0 * spacing, y0 + r0 * spacing
     result = dict(height=height, rgb=rgb, coverage=coverage, x0=x0, y0=y0, faces=faces, objs=len(objs))
+    if recovered:  # truncated archive read entry by entry: only its whole entries are in the grid
+        result['recovered_entries'] = len(infos)
     if facades is not None:
         result.update(facades.result())
     return result
@@ -588,6 +686,7 @@ def process_tile(dataset_name, dataset, tile, output_dir, spacing, supersample, 
     temporary.replace(destination)
     valid = np.isfinite(grid['height'])
     record = dict(tile=tile, shape=list(grid['height'].shape), faces=grid['faces'], objs=grid.get('objs'),
+                  recovered_entries=grid.get('recovered_entries'),
                   covered_fraction=float(valid.mean()), archive_bytes=archive_bytes,
                   downloaded_bytes=downloaded, cache_bytes=destination.stat().st_size,
                   download_s=round(t_download, 1), total_s=round(time.monotonic() - start, 1))
@@ -597,7 +696,9 @@ def process_tile(dataset_name, dataset, tile, output_dir, spacing, supersample, 
                       facade_samples=int(grid['facade_samples']))
     print(f"{tile}: {record['shape']}, covered {record['covered_fraction']:.1%}, "
           f"{archive_bytes/1e6:.0f} MB -> {record['cache_bytes']/1e6:.1f} MB, {record['total_s']} s"
-          + (f", {record['facade_voxels']:,} facade voxels" if facade_voxel else ''), flush=True)
+          + (f", {record['facade_voxels']:,} facade voxels" if facade_voxel else '')
+          + (f", TRUNCATED archive: {record['recovered_entries']:,} whole entries recovered"
+             if record['recovered_entries'] else ''), flush=True)
     return record
 
 
@@ -782,14 +883,29 @@ def main():
                         help='grid only: do not store the facade voxels (terrain_to_render.py --walls needs them)')
     parser.add_argument('--facade-voxel', type=float, default=1.0, help='facade voxel size in metres (default 1)')
     parser.add_argument('--tag', help='suffix of the tile folder, <spacing>m_<tag>/ (not used by the pipeline)')
+    parser.add_argument('--datasets', type=Path, help='terrain_datasets.json to use (default: the repository one)')
     args = parser.parse_args()
 
-    dataset = load_datasets()[args.dataset]
-    output_dir = args.output / args.dataset / (f'{args.spacing:g}m' + (f'_{args.tag}' if args.tag else ''))
+    datasets = load_datasets(args.datasets) if args.datasets else load_datasets()
+    dataset = datasets[args.dataset]
+    members = dataset.get('members')
+    if members and args.tiles:
+        raise SystemExit(f'{args.dataset} is composite ({", ".join(members)}): select its tiles with '
+                         '--tiles-from, --bbox or --all, or cache a member with --dataset <member> --tiles')
+    failures = []
+    for name in members or [args.dataset]:  # a composite dataset caches each member in its own folder
+        failures += cache_dataset(name, datasets[name], args)
+    if failures:
+        raise SystemExit(f'{len(failures)} tiles failed: {failures}')
+
+
+def cache_dataset(name, dataset, args):
+    """Cache the selected tiles of one (non-composite) dataset; return the tiles that failed."""
+    output_dir = args.output / name / (f'{args.spacing:g}m' + (f'_{args.tag}' if args.tag else ''))
     if args.rebuild_log:
         kept, added = rebuild_log(output_dir)
         print(f'{output_dir / "log.jsonl"}: {kept} lines kept, {added} rebuilt', flush=True)
-        return
+        return []
     tiles = select_tiles(args, dataset)[:args.limit]
     facade_voxel = None if args.no_facades else args.facade_voxel
     # Cached tiles are reused as they are: check every tile already in the folder (not only the
@@ -798,18 +914,18 @@ def main():
         check_folder(output_dir, (args.spacing, args.supersample, facade_voxel))
     output_dir.mkdir(parents=True, exist_ok=True)
     todo = [t for t in tiles if not (output_dir / f'{t}.npz').exists()]
-    print(f'{args.dataset}: {len(tiles)} tiles selected, {len(tiles) - len(todo)} cached, '
+    print(f'{name}: {len(tiles)} tiles selected, {len(tiles) - len(todo)} cached, '
           f'{len(todo)} to process -> {output_dir}', flush=True)
     if args.dry_run:
         for t in todo:
             print(t)
-        return
-    describe_dataset(args.dataset, dataset, args.output / args.dataset)
+        return []
+    describe_dataset(name, dataset, args.output / name)
     log = output_dir / 'log.jsonl'
     failures = []
     bounds = tile_bounds(dataset, todo)
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        jobs = {pool.submit(process_tile, args.dataset, dataset, t, output_dir, args.spacing,
+        jobs = {pool.submit(process_tile, name, dataset, t, output_dir, args.spacing,
                             args.supersample, args.archives, args.keep_archives,
                             facade_voxel, bounds.get(t)): t for t in todo}
         for job in as_completed(jobs):  # log each tile when it completes, so an interrupted run loses no record
@@ -819,10 +935,9 @@ def main():
                 with log.open('a') as stream:
                     stream.write(json.dumps(record) + '\n')
             except Exception as error:  # keep going; failed tiles are retried on the next run
-                failures.append(tile)
+                failures.append(f'{name}/{tile}')
                 print(f'{tile}: FAILED {error!r}', flush=True)
-    if failures:
-        raise SystemExit(f'{len(failures)} tiles failed: {failures}')
+    return failures
 
 
 if __name__ == '__main__':
