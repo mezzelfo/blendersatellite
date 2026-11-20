@@ -45,3 +45,6 @@ OBJ/
 !output/orbits_melbourne/20261118T164126Z_run_lxrAFk/
 !output/orbits_melbourne/20261118T164126Z_run_lxrAFk/band_samples/
 !output/orbits_melbourne/20261118T164126Z_run_lxrAFk/band_samples/**
+
+# macOS Finder metadata, anywhere; kept last so that it wins over the ! rules above
+.DS_Store
