@@ -195,8 +195,11 @@ correction of that member towards the first one and writes
 which also caches the shared-area tiles the first time):
 
 - height: median of the height difference on flat cells per 250 m block, interpolated between
-  blocks, in full near the shared area and tapered to zero over 2 km beyond it (the offsets
-  measured between Helsinki and Espoo are local: -0.4 to +1.9 m within a few km);
+  blocks, in full near the shared area and tapered to zero over 2 km beyond it. The offsets
+  between Helsinki and Espoo are local: median +0.09 m, up to about +5 m in the north-east of the
+  shared area, coherent between neighbouring blocks. A block more than 2 m away from the median
+  of the blocks within 600 m (`--outlier-m`, `--neighbour-m`) is a surface that changed between
+  the flights and is left out (listed under `rejected` in `correction.json`);
 - colour: per channel gain and offset matching mean and standard deviation (Espoo is about
   10 DN brighter and bluer than Helsinki), applied to the whole member.
 

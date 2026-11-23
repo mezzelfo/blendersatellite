@@ -114,3 +114,16 @@ def test_height_field_taper():
     field = tm.HeightField(dict(block_m=250., taper_m=2000., blocks=[[0., 0., 2., 5000]]))
     assert np.isclose(field(0., 0.), 2.) and np.isclose(field(250., 0.), 2.)
     assert np.isclose(field(1250., 0.), 1.) and np.isclose(field(2250., 0.), 0.) and field(5000., 0.) == 0.
+
+
+def test_reject_outliers():
+    """On a 5 x 5 grid of blocks with a smooth ramp, a single spike is rejected and the ramp is kept."""
+    x, y = np.meshgrid(np.arange(5) * 250., np.arange(5) * 250.)
+    dh = 0.002 * x  # +2 m over 1 km: a real, coherent offset
+    blocks = np.c_[x.ravel(), y.ravel(), dh.ravel(), np.full(25, 5000.)]
+    blocks[12, 2] += 15.  # centre block: a surface that changed between the flights
+    kept, rejected = tm.reject_outliers(blocks, outlier_m=2., neighbour_m=600.)
+    assert len(rejected) == 1 and rejected[0, 0] == 500. and rejected[0, 1] == 500.
+    assert len(kept) == 24
+    single, none = tm.reject_outliers(blocks[:1], 2., 600.)
+    assert len(single) == 1 and len(none) == 0

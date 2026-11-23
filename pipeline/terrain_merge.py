@@ -15,7 +15,9 @@ towards the first (the reference) with a model fitted on the cells they share wi
           convex hull), in full up to one block from a measured block centre and tapered linearly
           to zero over taper_m beyond, so the member keeps its own heights far from the shared area.
           The measured offsets are local (they change sign within a few km), so a single constant
-          would not do.
+          would not do. A block whose median differs by more than outlier_m from the median of the
+          blocks within neighbour_m is left out (a surface that changed between the two flights:
+          a building site, a ship, water); it is kept in the model under "rejected" for inspection.
   colour  per channel, moments matched over the shared cells: c' = gain * c + offset with
           gain = std_reference / std_member, offset = mean_reference - gain * mean_member, applied to
           the whole member (it comes from a different flight and camera).
@@ -46,7 +48,7 @@ from scipy.spatial import QhullError
 from terrain_cache import REPO, load_datasets, tile_index
 
 HERE = Path(__file__).resolve().parent
-DEFAULTS = dict(block_m=250., min_cells=2000, flat_std=0.15, taper_m=2000.)
+DEFAULTS = dict(block_m=250., min_cells=2000, flat_std=0.15, taper_m=2000., outlier_m=2., neighbour_m=600.)
 
 
 def composite_members(datasets, name):
@@ -84,7 +86,25 @@ def roughness(height):
     return np.where(count > 8.5, np.sqrt(np.maximum(var, 0.)), np.nan)
 
 
-def fit_member(cache_dirs, datasets, reference, member, spacing, block_m, min_cells, flat_std):
+def reject_outliers(blocks, outlier_m, neighbour_m):
+    """(kept, rejected) blocks [x, y, dh, cells]: a block is rejected when its dh differs by more than
+    outlier_m from the median dh of the other blocks within neighbour_m of its centre. A block
+    without neighbours is kept (nothing to compare it with)."""
+    blocks = np.asarray(blocks, dtype=np.float64).reshape(-1, 4)
+    if len(blocks) < 2:
+        return blocks, blocks[:0]
+    tree = cKDTree(blocks[:, :2])
+    residual = np.zeros(len(blocks))
+    for i, near in enumerate(tree.query_ball_point(blocks[:, :2], neighbour_m)):
+        others = [j for j in near if j != i]
+        if others:
+            residual[i] = blocks[i, 2] - np.median(blocks[others, 2])
+    bad = np.abs(residual) > outlier_m
+    return blocks[~bad], blocks[bad]
+
+
+def fit_member(cache_dirs, datasets, reference, member, spacing, block_m, min_cells, flat_std,
+               outlier_m=DEFAULTS['outlier_m'], neighbour_m=DEFAULTS['neighbour_m']):
     """Height blocks and colour moments of member against reference on their shared cells."""
     @lru_cache(maxsize=8)
     def load(name, tile):
@@ -138,6 +158,7 @@ def fit_member(cache_dirs, datasets, reference, member, spacing, block_m, min_ce
         if len(values) >= min_cells:
             bx, by = divmod(key, 10_000_000)
             blocks.append([(bx + .5) * block_m, (by + .5) * block_m, float(np.median(values)), int(len(values))])
+    kept, rejected = reject_outliers(blocks, outlier_m, neighbour_m)
     n, total, squares = moments[..., 0], moments[..., 1], moments[..., 2]
     with np.errstate(invalid='ignore', divide='ignore'):
         mean = total / n
@@ -148,12 +169,14 @@ def fit_member(cache_dirs, datasets, reference, member, spacing, block_m, min_ce
         colour = dict(gain=gain.tolist(), offset=(mean[0] - gain * mean[1]).tolist(),
                       mean_reference=mean[0].tolist(), mean_member=mean[1].tolist(),
                       std_reference=std[0].tolist(), std_member=std[1].tolist(), cells=int(n[0, 0]))
-    return dict(height=dict(block_m=block_m, blocks=blocks), colour=colour, pairs=len(pairs),
+    return dict(height=dict(block_m=block_m, blocks=kept.tolist(), rejected=rejected.tolist(), outlier_m=outlier_m,
+                            neighbour_m=neighbour_m), colour=colour, pairs=len(pairs),
                 pairs_used=n_pairs, missing_tiles=sorted(missing))
 
 
 def fit(cache_dir, datasets, name, spacing, block_m=DEFAULTS['block_m'], min_cells=DEFAULTS['min_cells'],
-        flat_std=DEFAULTS['flat_std'], taper_m=DEFAULTS['taper_m']):
+        flat_std=DEFAULTS['flat_std'], taper_m=DEFAULTS['taper_m'], outlier_m=DEFAULTS['outlier_m'],
+        neighbour_m=DEFAULTS['neighbour_m']):
     """Correction model of a composite dataset from the cached tiles of its members."""
     members = composite_members(datasets, name)
     if not members:
@@ -162,7 +185,8 @@ def fit(cache_dir, datasets, name, spacing, block_m=DEFAULTS['block_m'], min_cel
     model = dict(dataset=name, reference=members[0], spacing=spacing, flat_std=flat_std, min_cells=min_cells,
                  taper_m=taper_m, members={})
     for member in members[1:]:
-        model['members'][member] = fit_member(dirs, datasets, members[0], member, spacing, block_m, min_cells, flat_std)
+        model['members'][member] = fit_member(dirs, datasets, members[0], member, spacing, block_m, min_cells, flat_std,
+                                              outlier_m, neighbour_m)
         model['members'][member]['height']['taper_m'] = taper_m
     return model
 
@@ -263,6 +287,9 @@ def summary(model):
         blocks = np.asarray(entry['height']['blocks']).reshape(-1, 4)
         h = (f'{len(blocks)} blocks, dh median {np.median(blocks[:, 2]):+.2f} m, range {blocks[:, 2].min():+.2f}..'
              f'{blocks[:, 2].max():+.2f} m' if len(blocks) else 'no height blocks')
+        rejected = np.asarray(entry['height'].get('rejected', [])).reshape(-1, 4)
+        if len(rejected):
+            h += (f', {len(rejected)} rejected (dh ' + ', '.join(f'{v:+.1f}' for v in rejected[:, 2]) + ' m)')
         c = entry['colour']
         col = ('colour gain ' + '/'.join(f'{g:.3f}' for g in c['gain']) + ', offset '
                + '/'.join(f'{o:+.1f}' for o in c['offset']) + f' ({c["cells"]:,} cells)') if c else 'no colour model'
@@ -295,7 +322,7 @@ def main():
     if args.fetch:
         fetch(datasets, args.dataset, args.spacing, args.workers, args.archives, args.datasets)
     model = fit(cache_dir, datasets, args.dataset, args.spacing, args.block_m, args.min_cells, args.flat_std,
-                args.taper_m)
+                args.taper_m, args.outlier_m, args.neighbour_m)
     cache_dir.mkdir(parents=True, exist_ok=True)
     (cache_dir / 'correction.json').write_text(json.dumps(model, indent=1) + '\n')
     print(summary(model))
