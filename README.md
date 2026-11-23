@@ -251,7 +251,9 @@ metadata and `render_report.jsonl` record the actual selected devices. Terrain p
 runs on the CPU: `TERRAIN_WORKERS` (default 4) sets the number of
 `terrain_cache.py` processes and `TERRAIN_SPACING` (default `1`; `1`, `1.0` and
 `1.00` all use the same `1m/` cache folder) the cache spacing in metres;
-`TERRAIN_ARCHIVES=/path/to/zips` reuses already downloaded tile archives. `WALLS` (default
+`TERRAIN_ARCHIVES=/path/to/zips` reuses already downloaded tile archives; `MESH_STORE` keeps
+every downloaded archive in `$MESH_STORE/<dataset>/<tile>.zip` and reuses it (see Storage);
+`OUTPUT_ROOT` (default `output/`) is where the runs go, `$OUTPUT_ROOT/$DATASET/<run>`. `WALLS` (default
 `1`) and `WALL_THRESHOLD` (default `2` m) choose the terrain with or without walls
 (see Terrain data, "Walls from the photomesh facades"). GPU denoising
 is disabled for these small previews so it does not introduce an unsupported
@@ -519,6 +521,21 @@ Orbit-driven swarm pipeline:
 - `archive/`: superseded scripts and the terrain 3D study of step 20, kept for reference; their paths
   are not updated and they may not run from there.
 - `Prompts/`: step-by-step prompts and reports of the development (historical paths).
+
+## Storage
+
+The pipeline needs three kinds of space, which can live on different disks:
+
+- terrain caches, `data/terrain/<dataset>/<spacing>m` (small, read by every run): `data` can be a
+  symbolic link to a fast disk, e.g. `ln -s /media/SSD2/pareschi/blendersatellite/data data`;
+- runs, `$OUTPUT_ROOT/<dataset>/<run>` (large while rendering and stacking): `OUTPUT_ROOT` on the
+  fast disk; finished runs are moved by hand to the archive disk;
+- original mesh ZIPs (large, written once): `MESH_STORE` on the archive disk, e.g.
+  `/media/HDD/pareschi/blendersatellite/meshes`; without it the ZIPs are deleted after caching.
+
+`output/` itself stays a folder of the repository (it holds tracked reports of the Melbourne runs).
+`MESH_STORE` and `OUTPUT_ROOT` are environment variables, so they can be set once in `~/.bashrc`;
+`terrain_cache.py` and `terrain_merge.py --fetch` also read `MESH_STORE`.
 
 ## Assumptions and notes
 

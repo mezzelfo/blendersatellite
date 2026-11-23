@@ -30,6 +30,8 @@ output/**
 !output/terrain_3d_study/20261116T133629Z/samples/
 !output/terrain_3d_study/20261116T133629Z/samples/**
 data/
+# data may be a symbolic link to another disk (README "Storage"): data/ does not match a link
+/data
 OBJ/
 *.zip
 *.blend

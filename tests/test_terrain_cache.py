@@ -14,6 +14,7 @@ The step-22 tests below (facades and walls) add tiles WALLS, SEAM_W and SEAM_E.
 """
 import io
 import json
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -698,3 +699,29 @@ def test_intact_archive_keeps_its_last_entry():
         f.write(buffer.getvalue()); f.flush()
         with tc.SequentialZip(f.name) as archive:
             assert archive.namelist() == ['a.txt', 'b.txt'] and archive.read('b.txt') == b'second ' * 100
+
+
+def test_mesh_store_keeps_and_reuses_archives(tmp_path, monkeypatch):
+    """With a mesh store a missing archive is downloaded into <store>/<dataset>/<tile>.zip and kept;
+    the next run reuses it without downloading."""
+    source, store, out = tmp_path / 'source.zip', tmp_path / 'store' / 'test', tmp_path / 'out'
+    out.mkdir()
+    lod_tree_zip(source)
+    calls = []
+
+    def fake_download(url, destination, retries=3, chunk=1 << 20):
+        calls.append(url)
+        shutil.copyfile(source, destination)
+        return destination.stat().st_size
+
+    monkeypatch.setattr(tc, 'download', fake_download)
+    dataset = dict(format='obj_zip', url='https://example.invalid/Mesh_{tile}.zip', projected_epsg=3879,
+                   geographic_epsg=4258, mesh_origin=list(GK_ORIGIN), raster_bounds='tile',
+                   index=dict(GRID_SPEC, id_regex=r'^(?P<y>\d{3})(?P<x>\d{3})x2$', tiles=['668490x2']))
+    bounds = tc.tile_bounds(dataset, ['668490x2'])['668490x2']
+    first = tc.process_tile('test', dataset, '668490x2', out, 2.0, 2, None, False, 1.0, bounds, store)
+    assert calls == ['https://example.invalid/Mesh_668490x2.zip'] and (store / '668490x2.zip').exists()
+    assert first['downloaded_bytes'] > 0 and not (out / 'downloads').exists()
+    (out / '668490x2.npz').unlink()
+    second = tc.process_tile('test', dataset, '668490x2', out, 2.0, 2, None, False, 1.0, bounds, store)
+    assert len(calls) == 1 and second['downloaded_bytes'] == 0 and (store / '668490x2.zip').exists()

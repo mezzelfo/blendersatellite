@@ -44,6 +44,11 @@ Example (Melbourne, tiles chosen by an existing simulation):
       --tiles-from output/.../simulation/cameras.json --workers 4
   (tiles in data/terrain/melbourne_2020/1m/, dataset.json and tile_grid.json one level up)
 
+Mesh store: with --mesh-store DIR (or the environment variable MESH_STORE) the original ZIPs
+are kept in DIR/<dataset>/<tile>.zip instead of being deleted, and reused by later runs (another
+spacing, other facade settings) without downloading them again. A download is written to
+<tile>.zip.part and renamed when complete, so an interrupted one is never reused.
+
 log.jsonl in the tile folder gets one line per tile as soon as that tile is written. To
 recreate missing lines from the .npz files present (download fields left null):
   python pipeline/terrain_cache.py --dataset melbourne_2020 --spacing 1.0 --rebuild-log
@@ -649,19 +654,24 @@ def check_folder(output_dir, kind):
 # ----------------------------------------------------------------------------- one tile
 
 def process_tile(dataset_name, dataset, tile, output_dir, spacing, supersample, archives, keep,
-                 facade_voxel=None, bounds=None):
+                 facade_voxel=None, bounds=None, store=None):
     """Download (or reuse) one archive, rasterise it, write the cache, drop the archive.
 
-    bounds (xmin, ymin, xmax, ymax) fixes the grid extent (dataset raster_bounds 'tile')."""
+    bounds (xmin, ymin, xmax, ymax) fixes the grid extent (dataset raster_bounds 'tile').
+    store (the dataset folder of the mesh store, <mesh store>/<dataset>) is searched like
+    archives, and a missing archive is downloaded there as <tile>.zip and kept."""
     start = time.monotonic()
     destination = output_dir / f'{tile}.npz'
     url = dataset['url'].format(tile=tile)
-    local = None
-    if archives:  # an already downloaded archive: <tile>.zip or the file name of its URL
-        names = (f'{tile}.zip', url.rsplit('/', 1)[-1].split('?', 1)[0])
-        local = next((archives / n for n in names if (archives / n).exists()), None)
+    names = (f'{tile}.zip', url.rsplit('/', 1)[-1].split('?', 1)[0])  # <tile>.zip or the file name of its URL
+    local = next((folder / n for folder in (archives, store) if folder for n in names if (folder / n).exists()), None)
     if local is not None:
         archive, downloaded, owned = local, 0, False
+    elif store:
+        archive = store / f'{tile}.zip'
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        downloaded = download(url, archive)
+        owned = False
     else:
         archive = output_dir / 'downloads' / f'{tile}.zip'
         archive.parent.mkdir(exist_ok=True)
@@ -876,6 +886,10 @@ def main():
     parser.add_argument('--supersample', type=int, default=4, help='sub-cells per output cell along each axis')
     parser.add_argument('--archives', type=Path, help='directory with already downloaded ZIPs to reuse')
     parser.add_argument('--keep-archives', action='store_true', help='do not delete downloaded ZIPs')
+    parser.add_argument('--mesh-store', type=Path, default=os.environ.get('MESH_STORE') or None,
+                        help='folder that keeps the original ZIPs, in <mesh store>/<dataset>/<tile>.zip: '
+                             'reused when present, downloaded there and kept when missing '
+                             '(default: the environment variable MESH_STORE; none: ZIPs are deleted)')
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--limit', type=int, help='process only the first N selected tiles')
     parser.add_argument('--dry-run', action='store_true', help='print the selection and the estimate, do nothing')
@@ -927,7 +941,8 @@ def cache_dataset(name, dataset, args):
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         jobs = {pool.submit(process_tile, name, dataset, t, output_dir, args.spacing,
                             args.supersample, args.archives, args.keep_archives,
-                            facade_voxel, bounds.get(t)): t for t in todo}
+                            facade_voxel, bounds.get(t), args.mesh_store / name if args.mesh_store else None): t
+                for t in todo}
         for job in as_completed(jobs):  # log each tile when it completes, so an interrupted run loses no record
             tile = jobs[job]
             try:

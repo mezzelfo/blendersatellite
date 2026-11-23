@@ -8,6 +8,9 @@ PIPELINE_DIR="$PROJECT_DIR/pipeline"
 ORBITS_DIR="$PROJECT_DIR/orbits"
 DATASET="${DATASET:-melbourne_2020}"
 # Optional folder of already downloaded tile archives (TERRAIN_ARCHIVES); missing tiles are downloaded.
+# MESH_STORE (environment, read by terrain_cache.py): folder that keeps the original ZIPs as
+# <MESH_STORE>/<dataset>/<tile>.zip; without it the downloaded ZIPs are deleted after caching.
+# OUTPUT_ROOT (default <repo>/output): the runs go to $OUTPUT_ROOT/$DATASET/ (RUNS_ROOT overrides it).
 TERRAIN_ARCHIVE_DIR="${TERRAIN_ARCHIVES:-}"
 TERRAIN_SPACING="${TERRAIN_SPACING:-1}"
 # Terrain walls (README "Walls from the photomesh facades"): WALLS=1 (default) adds vertical walls
@@ -31,7 +34,8 @@ MAX_WORKERS_PER_GPU="${MAX_WORKERS_PER_GPU:-4}"
 POOL_OPTS=(--gpus "$GPUS" --max-workers-per-gpu "$MAX_WORKERS_PER_GPU" --chunk "${RENDER_CHUNK:-20}")
 if [[ -n "${WORKERS_PER_GPU:-}" ]]; then POOL_OPTS+=(--workers-per-gpu "$WORKERS_PER_GPU"); fi
 if [[ -n "${DEVICE_MAP:-}" ]]; then POOL_OPTS+=(--device-map "$DEVICE_MAP"); fi
-RUNS_ROOT="${RUNS_ROOT:-$PROJECT_DIR/output/$DATASET}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_DIR/output}"
+RUNS_ROOT="${RUNS_ROOT:-$OUTPUT_ROOT/$DATASET}"
 FORMATION="${FORMATION:-train}"
 TRAIN_SPACING_M="${TRAIN_SPACING_M:-1000}"
 # Optional acquisition file (orbits/data/acquisitions/*.json, e.g. hex7_async_10deg.json):
@@ -89,6 +93,9 @@ ARCHIVE_OPTS=()
 if [[ -n "$TERRAIN_ARCHIVE_DIR" && -d "$TERRAIN_ARCHIVE_DIR" ]]; then
     ARCHIVE_OPTS=(--archives "$TERRAIN_ARCHIVE_DIR")
     echo "Reusing downloaded archives from $TERRAIN_ARCHIVE_DIR"
+fi
+if [[ -n "${MESH_STORE:-}" ]]; then
+    echo "Mesh store: $MESH_STORE/<dataset>/ (original ZIPs kept and reused)"
 fi
 # Always import the pinned submodule, even if an old editable installation points
 # at a different checkout of orbits in the conda environment.
