@@ -29,6 +29,13 @@
     "projected_epsg": 3879,
     "geographic_epsg": 4258,
     "vertical": "EGM96 heights (metadata.xml: EPSG:3879+5773), used as approximate ellipsoidal height downstream",
+    "target": {
+      "projected_xy": [
+        25501000.0,
+        6677000.0
+      ],
+      "note": "scene point overflown at capture time, in projected_epsg: chosen to maximise the part of the full sensor footprint covered by Helsinki alone (about 93% by the tile index); at the helsinki_espoo_2017 target, in Espoo, Helsinki alone would cover about 19% of it"
+    },
     "mesh_origin": [
       25490000.0,
       6668000.0,
@@ -54,6 +61,13 @@
     "projected_epsg": 3879,
     "geographic_epsg": 4258,
     "vertical": "N2000, used as approximate ellipsoidal height downstream",
+    "target": {
+      "projected_xy": [
+        25483000.0,
+        6677500.0
+      ],
+      "note": "scene point overflown at capture time, in projected_epsg: the target of helsinki_espoo_2017, so the two can be compared; Espoo alone covers about 92% of the sensor footprint there (tile index)"
+    },
     "mesh_origin": [
       25481691.0,
       6680412.0,
@@ -80,6 +94,13 @@
     ],
     "projected_epsg": 3879,
     "geographic_epsg": 4258,
-    "vertical": "members' heights (Helsinki EGM96 per its metadata, Espoo N2000) used as approximate ellipsoidal height; Espoo corrected towards Helsinki near the shared area"
+    "vertical": "members' heights (Helsinki EGM96 per its metadata, Espoo N2000) used as approximate ellipsoidal height; Espoo corrected towards Helsinki near the shared area",
+    "target": {
+      "projected_xy": [
+        25483000.0,
+        6677500.0
+      ],
+      "note": "scene point overflown at capture time, in projected_epsg: chosen to maximise the part of the full sensor footprint (about 19.7 km x 19.7 km, rotated about 17 deg) covered by the merged mesh, 96% by the tile indices; in Espoo, about 6 km west of the Helsinki border"
+    }
   }
 }
