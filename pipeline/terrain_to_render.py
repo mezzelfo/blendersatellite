@@ -38,6 +38,22 @@ other members' faces there are dropped through the key face_keep (rows - 1, cols
 for the grid quads to draw (see composite_keep), and the walls follow the same ownership.
 
 tiles.json in the output folder lists the converted tiles (render_swarm.py loads those).
+
+--texture-spacing T moves the terrain colour from the vertices to a texture: every tile gets an
+RGB image <tile>_texture.png of the cache colours binned to T metres (the cache spacing, 1 m, by
+default in run_swarm.sh), over the extent of its render grid, empty texels filled from the
+nearest covered one; the vertices carry texture coordinates instead of colours. With the colour
+in the texture the geometry can be simplified without losing colour detail: --simplify-tolerance
+E (metres, needs --texture-spacing) replaces aligned square blocks of 2 to 128 grid quads whose
+vertices lie within E of their least-squares plane by a fan of triangles (see simplify_grid).
+The textured output has the keys
+  vertices   float32 (V, 3), local frame
+  uv         float32 (V, 2), texture coordinates (0, 0) = south-west corner of the texture
+  triangles  int32 (T, 3), counter-clockwise seen from above
+  texture    file name of the texture image (beside the .npz), texture_spacing, shape (rows, cols
+             of the render grid), sampled_fraction, and the wall keys above (walls keep their
+             vertex colours). face_keep is applied before the simplification and not written.
+cache_frame.json records the texture and simplification settings, so the two formats never mix.
 """
 import argparse
 import json
@@ -45,6 +61,8 @@ from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+from PIL import Image
 from pyproj import Transformer
 from scipy.ndimage import distance_transform_edt
 
@@ -128,6 +146,139 @@ def render_grid(cache_path, target, correction=None):
     rgb = rgb[tuple(nearest)]
     return dict(height=h, rgb=rgb, weight=np.where(valid, weight, 0.), x0=x0, y0=y0,
                 i0=int(round(x0 / target)), j0=int(round(y0 / target)), sampled_fraction=float(valid.mean()))
+
+
+def render_texture(cache_path, grid, target, texel, correction=None):
+    """Texture of one tile for its render grid: the cache colours binned to texel metres on a
+    lattice aligned to multiples of texel, covering the render cells [x0, x0 + cols * target) x
+    [y0, y0 + rows * target) of grid (render_grid), so every vertex (cell centre) falls inside it.
+    Texels without cache data take the colour of the nearest covered texel; correction
+    (terrain_merge.MemberCorrection) corrects the colours. Returns image (rows, cols, 3) uint8
+    with row 0 at the SOUTH edge, and its south-west corner tx0, ty0."""
+    with np.load(cache_path) as data:
+        _, rgb, bx0, by0, weight = bin_to_spacing(data['height'], data['rgb'], data['coverage'],
+                                                  float(data['x0']), float(data['y0']), float(data['spacing']),
+                                                  texel, return_weight=True)
+    rows, cols = grid['height'].shape
+    tx0, ty0 = np.floor(grid['x0'] / texel + 1e-9) * texel, np.floor(grid['y0'] / texel + 1e-9) * texel
+    n_cols = int(np.ceil((grid['x0'] + cols * target - tx0) / texel - 1e-9))
+    n_rows = int(np.ceil((grid['y0'] + rows * target - ty0) / texel - 1e-9))
+    image = np.zeros((n_rows, n_cols, 3), np.uint8)
+    valid = np.zeros((n_rows, n_cols), bool)
+    c0, r0 = int(round((bx0 - tx0) / texel)), int(round((by0 - ty0) / texel))
+    br, bc = rgb.shape[:2]
+    src_r0, src_c0 = max(0, -r0), max(0, -c0)
+    dst_r0, dst_c0 = max(0, r0), max(0, c0)
+    n_r, n_c = min(br - src_r0, n_rows - dst_r0), min(bc - src_c0, n_cols - dst_c0)
+    if n_r > 0 and n_c > 0:
+        dst = (slice(dst_r0, dst_r0 + n_r), slice(dst_c0, dst_c0 + n_c))
+        src = (slice(src_r0, src_r0 + n_r), slice(src_c0, src_c0 + n_c))
+        image[dst] = rgb[src]
+        valid[dst] = weight[src] > 0
+    if not valid.any():
+        raise ValueError(f'No covered texels in {cache_path}')
+    nearest = distance_transform_edt(~valid, return_distances=False, return_indices=True)
+    image = image[tuple(nearest)]
+    if correction is not None:
+        image = correction.colour(image)
+    return image, float(tx0), float(ty0)
+
+
+# ----------------------------------------------------------------------------- simplification
+
+SIMPLIFY_LEVELS = (128, 64, 32, 16, 8, 4, 2)
+
+
+def _block_perimeter(s):
+    """(row, col) offsets of the 4 s vertices on the boundary of an s x s block of quads, counter-
+    clockwise seen from above (row = +y, col = +x), starting at the south-west corner."""
+    k = np.arange(s)
+    rows = np.concatenate([np.zeros(s), k, np.full(s, s), s - k]).astype(np.int64)
+    cols = np.concatenate([k, np.full(s, s), s - k, np.zeros(s)]).astype(np.int64)
+    return rows, cols
+
+
+def simplify_grid(height, drawable, tolerance, levels=SIMPLIFY_LEVELS):
+    """Triangles of a 2.5D grid with flat areas merged.
+
+    height (rows, cols): vertex heights; drawable (rows - 1, cols - 1): quads to draw. From the
+    largest level down, every aligned block of s x s quads that are all drawable and not taken
+    by a larger block is merged when all its (s + 1)^2 vertices lie within tolerance of their
+    least-squares plane. A merged block keeps, on its boundary, every vertex that is a corner of
+    another block or of a single quad, lies on the grid border or touches a quad not drawn, so
+    neighbouring blocks share their vertices (no T-junction, no crack). A block whose boundary
+    keeps only its 4 corners becomes 2 triangles; any other block a fan of triangles around a
+    new vertex at its centre, on the plane. The surface stays within 2 * tolerance of every grid
+    vertex. Quads not in any block keep their 2 triangles. tolerance <= 0: no merging.
+    Returns triangles (T, 3) int64 into the vertex list, and vertices as (ids, centres): ids
+    (V0,) grid vertex ids (row * cols + col) used, then centres (V1, 3) = (row, col, height) of
+    the added centre vertices in grid units; triangle indices refer to ids followed by centres."""
+    rows, cols = height.shape
+    taken = ~drawable.astype(bool)
+    blocks = []
+    for s in (levels if tolerance > 0 else ()):
+        nr, nc = (rows - 1) // s, (cols - 1) // s
+        if nr == 0 or nc == 0:
+            continue
+        z = sliding_window_view(height, (s + 1, s + 1))[::s, ::s][:nr, :nc]
+        busy = taken[:nr * s, :nc * s].reshape(nr, s, nc, s).any(axis=(1, 3))
+        u = np.arange(s + 1, dtype=np.float64) - s / 2
+        var = (u ** 2).mean()
+        mean = z.mean(axis=(2, 3))
+        gx = (z * u[None, None, None, :]).mean(axis=(2, 3)) / var
+        gy = (z * u[None, None, :, None]).mean(axis=(2, 3)) / var
+        plane = mean[..., None, None] + gx[..., None, None] * u[None, None, None, :] + gy[..., None, None] * u[None, None, :, None]
+        ok = ~busy & np.isfinite(mean) & (np.abs(z - plane).max(axis=(2, 3)) <= tolerance)
+        if not ok.any():
+            continue
+        taken[:nr * s, :nc * s] |= np.repeat(np.repeat(ok, s, 0), s, 1)
+        br, bc = np.nonzero(ok)
+        blocks.append((s, br * s, bc * s, mean[ok]))
+    qr, qc = np.nonzero(drawable.astype(bool) & ~taken)  # single quads: drawn, in no merged block
+    required = np.zeros((rows, cols), bool)
+    required[[0, -1], :] = True
+    required[:, [0, -1]] = True
+    not_drawn = ~drawable.astype(bool)
+    for dr in (0, 1):
+        for dc in (0, 1):
+            required[dr:rows - 1 + dr, dc:cols - 1 + dc] |= not_drawn
+            required[qr + dr, qc + dc] = True
+    for s, r0, c0, _ in blocks:
+        for dr in (0, s):
+            for dc in (0, s):
+                required[r0 + dr, c0 + dc] = True
+    ids = lambda r, c: r * cols + c  # noqa: E731
+    tris = [np.stack([ids(qr, qc), ids(qr, qc + 1), ids(qr + 1, qc + 1)], 1),
+            np.stack([ids(qr, qc), ids(qr + 1, qc + 1), ids(qr + 1, qc)], 1)]
+    centres, n_centres = [], 0
+    for s, r0, c0, mean in blocks:
+        pr, pc = _block_perimeter(s)
+        rr, cc = r0[:, None] + pr[None, :], c0[:, None] + pc[None, :]
+        keep = required[rr, cc]
+        corners_only = keep.sum(1) == 4
+        a, b, d, c = ids(r0, c0), ids(r0, c0 + s), ids(r0 + s, c0 + s), ids(r0 + s, c0)
+        m = corners_only
+        tris += [np.stack([a[m], b[m], d[m]], 1), np.stack([a[m], d[m], c[m]], 1)]
+        fan = ~corners_only
+        if fan.any():
+            k = np.flatnonzero(fan)
+            vid = ids(rr[k], cc[k])[keep[k]]
+            owner = np.repeat(np.arange(len(k)), keep[k].sum(1))
+            start = np.r_[0, np.cumsum(keep[k].sum(1))[:-1]]
+            nxt = np.arange(len(vid)) + 1
+            last = np.r_[start[1:], len(vid)] - 1
+            nxt[last] = start
+            centre_id = -1 - (n_centres + owner)  # negative: centre vertices, resolved below
+            tris.append(np.stack([centre_id, vid, vid[nxt]], 1))
+            centres.append(np.c_[r0[k] + s / 2, c0[k] + s / 2, mean[k]])
+            n_centres += len(k)
+    tris = np.concatenate(tris) if tris else np.zeros((0, 3), np.int64)
+    grid_used = np.unique(tris[tris >= 0])
+    remap = np.full(rows * cols, -1, np.int64)
+    remap[grid_used] = np.arange(len(grid_used))
+    out = np.where(tris >= 0, remap[np.maximum(tris, 0)], len(grid_used) + (-1 - tris))
+    centres = np.concatenate(centres) if centres else np.zeros((0, 3))
+    return out, (grid_used, centres)
 
 
 def to_local(xyz, manifest, dataset):
@@ -471,12 +622,15 @@ def face_keep_of(keep):
 
 # ----------------------------------------------------------------------------- output
 
-def convert_tile(grid, output, manifest, dataset, target, walls=None, face_keep=None):
-    """Write the render .npz of one tile from its render_grid (and build_walls result)."""
+def convert_tile(grid, output, manifest, dataset, target, walls=None, face_keep=None, texture=None,
+                 tolerance=0.):
+    """Write the render .npz of one tile from its render_grid (and build_walls result).
+
+    texture: (image, tx0, ty0, texel) from render_texture, for the textured format (written as
+    <output stem>_texture.png), with the grid simplified by simplify_grid(tolerance).
+    Returns rows, cols of the render grid and the number of terrain triangles."""
     h, rgb = grid['height'], grid['rgb']
     rows, cols = h.shape
-    xx, yy = np.meshgrid(grid['x0'] + (np.arange(cols) + .5) * target, grid['y0'] + (np.arange(rows) + .5) * target)
-    local = to_local(np.c_[xx.ravel(), yy.ravel(), h.ravel()], manifest, dataset)
     extra = {}
     if walls is not None:
         n = len(walls['quads'])
@@ -484,15 +638,38 @@ def convert_tile(grid, output, manifest, dataset, target, walls=None, face_keep=
         extra = dict(wall_vertices=to_local(walls['quads'].reshape(-1, 3), manifest, dataset).astype(np.float32),
                      wall_rgb=np.repeat(walls['rgb'], 4, axis=0), wall_segments=n, wall_edges=walls['edges'],
                      wall_sources=np.array(SOURCES), wall_source_counts=counts)
-    if face_keep is not None:
-        extra['face_keep'] = face_keep
+    if texture is not None:
+        image, tx0, ty0, texel = texture
+        drawable = face_keep if face_keep is not None else np.ones((rows - 1, cols - 1), bool)
+        triangles, (ids, centres) = simplify_grid(h, drawable, tolerance)
+        r, c = np.divmod(ids, cols)
+        grid_rc = np.c_[r, c, h.ravel()[ids]]
+        rcz = np.concatenate([grid_rc, centres]) if len(centres) else grid_rc
+        x = grid['x0'] + (rcz[:, 1] + .5) * target
+        y = grid['y0'] + (rcz[:, 0] + .5) * target
+        local = to_local(np.c_[x, y, rcz[:, 2]], manifest, dataset)
+        uv = np.c_[(x - tx0) / (image.shape[1] * texel), (y - ty0) / (image.shape[0] * texel)]
+        name = output.stem + '_texture.png'
+        part = output.parent / (name + '.part')
+        Image.fromarray(np.ascontiguousarray(image[::-1])).save(part, format='PNG', compress_level=3)
+        part.replace(output.parent / name)
+        arrays = dict(vertices=local.astype(np.float32), uv=uv.astype(np.float32),
+                      triangles=triangles.astype(np.int32), texture=name, texture_spacing=texel)
+        n_triangles = len(triangles)
+    else:
+        xx, yy = np.meshgrid(grid['x0'] + (np.arange(cols) + .5) * target,
+                             grid['y0'] + (np.arange(rows) + .5) * target)
+        local = to_local(np.c_[xx.ravel(), yy.ravel(), h.ravel()], manifest, dataset)
+        arrays = dict(vertices=local.astype(np.float32), rgb=rgb.reshape(-1, 3))
+        if face_keep is not None:
+            extra['face_keep'] = face_keep
+        n_triangles = 2 * int(face_keep.sum() if face_keep is not None else (rows - 1) * (cols - 1))
     temporary = output.with_suffix('.npz.part')
     with temporary.open('wb') as stream:
-        np.savez_compressed(stream, vertices=local.astype(np.float32), rgb=rgb.reshape(-1, 3),
-                            shape=np.array([rows, cols]), sampled_fraction=grid['sampled_fraction'],
-                            compute_device='cpu', compute_device_name='terrain_to_render.py', **extra)
+        np.savez_compressed(stream, shape=np.array([rows, cols]), sampled_fraction=grid['sampled_fraction'],
+                            compute_device='cpu', compute_device_name='terrain_to_render.py', **arrays, **extra)
     temporary.replace(output)
-    return rows, cols
+    return rows, cols, n_triangles
 
 
 def binned_shape(cache_path, target):
@@ -517,11 +694,19 @@ def main():
                         help='add vertical walls coloured from the facade voxels (cache not built with --no-facades)')
     parser.add_argument('--wall-threshold', type=float, default=2.0,
                         help='height difference (m) between adjacent render cells above which a wall is built')
+    parser.add_argument('--texture-spacing', type=float,
+                        help='texel size (m) of a per-tile terrain texture (e.g. the cache spacing, 1); '
+                             'default: colours on the vertices, as before')
+    parser.add_argument('--simplify-tolerance', type=float, default=0.,
+                        help='merge grid blocks whose vertices lie within this height (m) of a plane '
+                             '(needs --texture-spacing); 0: no merging')
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--dry-run', action='store_true', help='report what would be converted, write nothing')
     parser.add_argument('--datasets', type=Path, help='terrain_datasets.json to use (default: the repository one)')
     args = parser.parse_args()
 
+    if args.simplify_tolerance > 0 and not args.texture_spacing:
+        parser.error('--simplify-tolerance needs --texture-spacing (the colours of merged cells would be lost)')
     if args.output is None:
         args.output = args.cameras.resolve().parent.parent / 'terrain_render'
     manifest = json.loads(args.cameras.read_text())
@@ -533,6 +718,8 @@ def main():
     if args.walls:  # renders with and without walls must not share an output folder
         frame['walls'] = dict(threshold_m=args.wall_threshold, max_angle_deg=WALL_MAX_ANGLE_DEG,
                               fallback_cells=WALL_FALLBACK_CELLS)
+    if args.texture_spacing:
+        frame['mesh'] = dict(texture_spacing_m=args.texture_spacing, simplify_tolerance_m=args.simplify_tolerance)
     corrections = {}
     if members:  # composite: one entry per member tile, member caches beside the composite folder
         caches = member_cache_dirs(args.cache, members)
@@ -544,8 +731,8 @@ def main():
     rank = {m: k for k, m in enumerate(members or [args.dataset])}
     frame_path = args.output / 'cache_frame.json'
     if frame_path.exists() and json.loads(frame_path.read_text()) != frame:
-        raise ValueError('Frame, spacing, wall settings or composite correction differ from the existing output; '
-                         'use a new output directory')
+        raise ValueError('Frame, spacing, wall, texture or simplification settings or composite correction differ '
+                         'from the existing output; use a new output directory')
     if not args.dry_run:
         args.output.mkdir(parents=True, exist_ok=True)
         frame_path.write_text(json.dumps(frame, indent=2) + '\n')
@@ -578,11 +765,13 @@ def main():
         if out in missing:
             continue
         source, destination = c / f'{t}.npz', args.output / f'{out}.npz'
-        quads = None
+        quads, n_triangles = None, None
         if out not in todo:
             with np.load(destination) as data:  # already converted: count what the renderer will load
                 rows, cols = (int(n) for n in data['shape'])
-                if 'face_keep' in data.files:
+                if 'triangles' in data.files:
+                    n_triangles = int(data['triangles'].shape[0])
+                elif 'face_keep' in data.files:
                     quads = int(data['face_keep'].sum())
                 if 'wall_segments' in data.files:
                     wall_triangles += 2 * int(data['wall_segments'])
@@ -595,10 +784,20 @@ def main():
             grid = grids[out] if grids else render_grid(source, target)
             walls = build_walls(out, grids, load_voxels, target, args.wall_threshold) if args.walls else None
             face_keep = face_keep_of(composite_keep(out, grids)) if members else None
-            rows, cols = convert_tile(grid, destination, manifest, datasets[m], target, walls, face_keep)
+            texture = None
+            if args.texture_spacing:
+                image, tx0, ty0 = render_texture(source, grid, target, args.texture_spacing, corrections.get(m))
+                texture = (image, tx0, ty0, args.texture_spacing)
+            rows, cols, n_triangles = convert_tile(grid, destination, manifest, datasets[m], target, walls, face_keep,
+                                                   texture, args.simplify_tolerance)
             if face_keep is not None:
                 quads = int(face_keep.sum())
                 print(f'{out}: {quads:,} of {face_keep.size:,} grid quads drawn', flush=True)
+            if texture is not None:
+                full = 2 * (quads if quads is not None else (rows - 1) * (cols - 1))
+                print(f'{out}: {n_triangles:,} terrain triangles ({n_triangles / max(full, 1):.1%} of the '
+                      f'{full:,} of the drawn grid), texture {texture[0].shape[1]} x {texture[0].shape[0]} '
+                      f'at {args.texture_spacing:g} m', flush=True)
             if walls is not None:
                 wall_triangles += 2 * len(walls['quads'])
                 sources += np.bincount(walls['source'], minlength=len(SOURCES))
@@ -607,8 +806,9 @@ def main():
                       flush=True)
             done += 1
         vertices += rows * cols
-        # two triangles per drawn grid quad, as render_swarm.py builds them
-        triangles += 2 * (quads if quads is not None else (rows - 1) * (cols - 1))
+        # textured: the triangles written; else two per drawn grid quad, as render_swarm.py builds them
+        triangles += (n_triangles if n_triangles is not None
+                      else 2 * (quads if quads is not None else (rows - 1) * (cols - 1)))
     if not args.dry_run:
         present = [out for out, *_ in entries if out not in missing]
         (args.output / 'tiles.json').write_text(json.dumps(dict(dataset=args.dataset, tiles=present), indent=1) + '\n')

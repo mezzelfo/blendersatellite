@@ -184,6 +184,21 @@ missing). `terrain_cache.py` reads such an archive entry by entry from its local
 (`SequentialZip`), keeps the entries followed by a valid header (the cut one is left out) and
 logs `recovered_entries` for the tile; the sub-tiles after the cut stay empty.
 
+#### Textured, simplified terrain mesh
+
+A city dataset that covers the whole sensor footprint is too large for the render workers with one
+coloured vertex per 2.5 m cell: Helsinki + Espoo at 2.5 m was 186 M grid triangles and 216 M wall
+triangles (Melbourne: 14 M and 12 M), beyond the host memory of two Blender workers and the 12 GB
+of a TITAN Xp. `terrain_to_render.py --texture-spacing T` moves the terrain colour into one texture
+per tile (`<tile>_texture.png`, the cache colours binned to T m, row 0 north as any image), and
+`--simplify-tolerance E` then merges aligned square blocks of 2 to 128 grid quads whose vertices lie
+within E m of a plane (roads, lawns, flat roofs, water) into a few triangles; the boundary keeps
+every vertex shared with a neighbouring block, the tile border or a quad not drawn, so the mesh has
+no crack, and it stays within 2 E of every grid vertex. `run_swarm.sh` uses `TERRAIN_TEXTURE=1`
+(the cache spacing) and `TERRAIN_SIMPLIFY=0.25` by default; `TERRAIN_TEXTURE=0` gives the former
+vertex-coloured grid. Walls are unchanged (vertex colours, segments of at most one render cell).
+`render_swarm.py` reads either format; `cache_frame.json` keeps them apart.
+
 #### Composite terrain (adjacent datasets)
 
 A composite entry lists datasets in priority order, e.g. `helsinki_espoo_2017` with
@@ -251,6 +266,7 @@ metadata and `render_report.jsonl` record the actual selected devices. Terrain p
 runs on the CPU: `TERRAIN_WORKERS` (default 4) sets the number of
 `terrain_cache.py` processes and `TERRAIN_SPACING` (default `1`; `1`, `1.0` and
 `1.00` all use the same `1m/` cache folder) the cache spacing in metres;
+`TERRAIN_TEXTURE` and `TERRAIN_SIMPLIFY` choose the terrain mesh (see Terrain data, "Textured, simplified terrain mesh"); `ENGINE` (default `EEVEE`) is passed to Blender as `--engine` unless the arguments give one;
 `TERRAIN_ARCHIVES=/path/to/zips` reuses already downloaded tile archives; `MESH_STORE` keeps
 every downloaded archive in `$MESH_STORE/<dataset>/<tile>.zip` and reuses it (see Storage);
 `OUTPUT_ROOT` (default `output/`) is where the runs go, `$OUTPUT_ROOT/$DATASET/<run>`. `WALLS` (default

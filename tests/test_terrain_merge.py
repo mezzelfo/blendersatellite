@@ -73,7 +73,12 @@ def composite(tmp_path_factory):
     subprocess.run([sys.executable, str(ROOT / 'pipeline' / 'terrain_to_render.py'), '--cameras', str(cameras),
                     '--cache', str(root / 'AB' / '1m'), '--dataset', 'AB', '--output', str(out),
                     '--datasets', str(datasets_path), '--walls'], check=True, capture_output=True, text=True)
-    return dict(model=model, out=out)
+    textured = tmp / 'render_textured'
+    subprocess.run([sys.executable, str(ROOT / 'pipeline' / 'terrain_to_render.py'), '--cameras', str(cameras),
+                    '--cache', str(root / 'AB' / '1m'), '--dataset', 'AB', '--output', str(textured),
+                    '--datasets', str(datasets_path), '--walls', '--texture-spacing', '1', '--simplify-tolerance', '0.25'],
+                   check=True, capture_output=True, text=True)
+    return dict(model=model, out=out, textured=textured, a_rgb=a_rgb)
 
 
 def test_correction_model(composite):
@@ -127,3 +132,27 @@ def test_reject_outliers():
     assert len(kept) == 24
     single, none = tm.reject_outliers(blocks[:1], 2., 600.)
     assert len(single) == 1 and len(none) == 0
+
+
+def test_textured_composite(composite):
+    """Textured and simplified conversion of the composite: flat members merged into few triangles,
+    B's drawn area the same as with face_keep, B's texture corrected to A's colours, walls kept."""
+    from PIL import Image
+    tex, old = composite['textured'], composite['out']
+    frame = json.loads((tex / 'cache_frame.json').read_text())
+    assert frame['mesh'] == dict(texture_spacing_m=1.0, simplify_tolerance_m=0.25)
+    with np.load(old / 'B__001000.npz') as b_old, np.load(tex / 'B__001000.npz') as b:
+        assert 'rgb' not in b.files and 'face_keep' not in b.files
+        t = b['vertices'][b['triangles']]
+        area = .5 * np.abs((t[:, 1, 0] - t[:, 0, 0]) * (t[:, 2, 1] - t[:, 0, 1])
+                           - (t[:, 2, 0] - t[:, 0, 0]) * (t[:, 1, 1] - t[:, 0, 1]))
+        assert np.isclose(area.sum(), b_old['face_keep'].sum() * 2.5 ** 2, rtol=1e-3)
+        assert len(b["triangles"]) < 0.5 * 2 * b_old['face_keep'].sum()
+        assert (b['wall_vertices'].shape == b_old['wall_vertices'].shape)
+        image = np.asarray(Image.open(tex / str(b['texture'])))[::-1]  # row 0 south
+        assert np.all((b['uv'] >= 0) & (b['uv'] <= 1))
+    # B's texture starts at x = 50 m: its first 50 columns are the strip shared with A
+    shared = image[:, :50].astype(int) - composite['a_rgb'][:, 50:100].astype(int)
+    assert np.abs(shared).max() <= 2
+    with np.load(tex / 'A__000000.npz') as a:
+        assert len(a["triangles"]) < 0.5 * 2 * 39 * 39

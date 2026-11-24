@@ -23,6 +23,21 @@ case "$WALLS" in
     0) WALL_OPTS=() ;;
     *) echo "WALLS must be 0 or 1, not '$WALLS'" >&2; exit 1 ;;
 esac
+# Terrain mesh (terrain_to_render.py): TERRAIN_TEXTURE texel size in metres of the per-tile terrain
+# texture (default 1, the cache spacing; 0 = colours on the vertices as before), TERRAIN_SIMPLIFY
+# height tolerance in metres for merging flat grid blocks (default 0.25; 0 = full grid).
+TERRAIN_TEXTURE="${TERRAIN_TEXTURE:-1}"
+TERRAIN_SIMPLIFY="${TERRAIN_SIMPLIFY:-0.25}"
+MESH_OPTS=()
+if [[ "$TERRAIN_TEXTURE" != 0 ]]; then
+    MESH_OPTS=(--texture-spacing "$TERRAIN_TEXTURE" --simplify-tolerance "$TERRAIN_SIMPLIFY")
+elif [[ "$TERRAIN_SIMPLIFY" != 0 ]]; then
+    echo "TERRAIN_SIMPLIFY needs a texture (TERRAIN_TEXTURE > 0): merged cells would lose their colours" >&2; exit 1
+fi
+# Blender engine (ENGINE, default EEVEE): passed as --engine unless the arguments already give one.
+ENGINE="${ENGINE:-EEVEE}"
+RENDER_ARGS=("$@")
+if [[ " $* " != *" --engine "* && " $* " != *" --engine="* ]]; then RENDER_ARGS=(--engine "$ENGINE" "$@"); fi
 BLENDER="${BLENDER_BIN:-/snap/blender/current/blender}"
 # Rendering hardware (pipeline/render_pool.py, both render modes): GPUS=all or a list of GPUs
 # (nvidia-smi index or UUID), MAX_WORKERS_PER_GPU (default 4) caps the Blender workers per GPU,
@@ -87,6 +102,12 @@ if [[ "$WALLS" == 1 ]]; then
 else
     echo "Terrain: cache spacing $TERRAIN_SPACING m, walls OFF (WALLS=0, grid only)"
 fi
+if [[ "$TERRAIN_TEXTURE" != 0 ]]; then
+    echo "Terrain mesh: texture $TERRAIN_TEXTURE m, flat blocks merged within $TERRAIN_SIMPLIFY m"
+else
+    echo "Terrain mesh: vertex colours, full grid (TERRAIN_TEXTURE=0)"
+fi
+echo "Render arguments: ${RENDER_ARGS[*]}"
 echo "Render hardware: GPUS=$GPUS, MAX_WORKERS_PER_GPU=$MAX_WORKERS_PER_GPU${WORKERS_PER_GPU:+, WORKERS_PER_GPU=$WORKERS_PER_GPU}${DEVICE_MAP:+, DEVICE_MAP=$DEVICE_MAP} (decision logged by render_pool below)"
 trap 'echo "Run exited with status $?; artifacts: $RUN_DIR"' EXIT
 ARCHIVE_OPTS=()
@@ -123,7 +144,8 @@ conda run --no-capture-output -n orbits python "$PROJECT_DIR/pipeline/terrain_me
     ${ARCHIVE_OPTS[@]+"${ARCHIVE_OPTS[@]}"}
 conda run --no-capture-output -n orbits python "$PROJECT_DIR/pipeline/terrain_to_render.py" \
     --cameras "$ORBITS_RUN_DIR/cameras.json" \
-    --cache "$TERRAIN_CACHE_DIR" --dataset "$DATASET" ${WALL_OPTS[@]+"${WALL_OPTS[@]}"}
+    --cache "$TERRAIN_CACHE_DIR" --dataset "$DATASET" ${WALL_OPTS[@]+"${WALL_OPTS[@]}"} \
+    ${MESH_OPTS[@]+"${MESH_OPTS[@]}"}
 # Both render modes run persistent Blender workers on every selected GPU (pipeline/render_pool.py);
 # worker logs are in renders/queue/logs/, the hardware and sizing decisions in this log.
 if [[ "${RENDER_MODE:-frames}" == raw ]]; then
@@ -132,11 +154,11 @@ if [[ "${RENDER_MODE:-frames}" == raw ]]; then
         --cameras "$ORBITS_RUN_DIR/cameras.json" --terrain "$RUN_DIR/terrain_render" \
         --output "$RENDER_DIR" --blender "$BLENDER" "${POOL_OPTS[@]}" \
         --n-bands "${RAW_BANDS:-32}" --tdi-rows "${RAW_TDI_ROWS:-8}" \
-        --ref-every "${RAW_REF_EVERY:-100}" ${RAW_KEEP_FRAMES:+--keep-frames} -- "$@"
+        --ref-every "${RAW_REF_EVERY:-100}" ${RAW_KEEP_FRAMES:+--keep-frames} -- "${RENDER_ARGS[@]}"
 else
     # Every frame as PNG; --frames/--satellites/--crop in "$@" are honoured, --check-only runs one process.
     conda run --no-capture-output -n orbits python "$PROJECT_DIR/pipeline/render_pool.py" \
         --cameras "$ORBITS_RUN_DIR/cameras.json" --terrain "$RUN_DIR/terrain_render" \
-        --output "$RENDER_DIR" --blender "$BLENDER" "${POOL_OPTS[@]}" -- "$@"
+        --output "$RENDER_DIR" --blender "$BLENDER" "${POOL_OPTS[@]}" -- "${RENDER_ARGS[@]}"
 fi
 echo "Completed run: $RUN_DIR"
