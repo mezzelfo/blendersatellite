@@ -218,9 +218,10 @@ def main():
     material.node_tree.links.new(emission.outputs[0],output.inputs['Surface'])
     # Emission preserves the captured aerial texture illumination. This MVP
     # validates geometry/poses and does not infer illumination from orbit time.
-    def texture_material(name,image_path):
-        """Emission material reading the tile texture (terrain_to_render.py --texture-spacing) at the
-        mesh UV map; PNG textures are sRGB, so Blender converts them to scene linear itself."""
+    def texture_material(name,image_path,interpolation='Linear'):
+        """Emission material reading a tile texture (terrain_to_render.py --texture-spacing: terrain
+        'Linear', wall atlas 'Closest') at the mesh UV map; PNG textures are sRGB, so Blender converts
+        them to scene linear itself."""
         textured=bpy.data.materials.new(name)
         textured.use_nodes=True
         tnodes=textured.node_tree.nodes;tnodes.clear()
@@ -228,7 +229,7 @@ def main():
         temission=tnodes.new('ShaderNodeEmission')
         image=tnodes.new('ShaderNodeTexImage')
         image.image=bpy.data.images.load(str(image_path),check_existing=True)
-        image.interpolation='Linear';image.extension='EXTEND'
+        image.interpolation=interpolation;image.extension='EXTEND'
         textured.node_tree.links.new(image.outputs['Color'],temission.inputs['Color'])
         textured.node_tree.links.new(temission.outputs[0],tout.inputs['Surface'])
         return textured
@@ -245,32 +246,40 @@ def main():
             if textured:
                 # Textured terrain: explicit (possibly simplified) triangles with texture coordinates.
                 faces=data['triangles'].astype(np.int64);uv=data['uv'];rgb=None
-                texture_path=args.terrain/str(data['texture'])
+                texture=(uv,args.terrain/str(data['texture']),'Linear')
             else:
                 rgb=data['rgb'].astype(float)/255
                 rows,cols=data['shape']
                 # Composite terrain: grid quads of this tile to draw (cells of a higher-priority dataset dropped).
                 face_keep=data['face_keep'].ravel() if 'face_keep' in data.files else None
-            # Optional walls (terrain_to_render.py --walls): 4 corners per segment, same colour handling.
-            walls=(data['wall_vertices'],data['wall_rgb'].astype(float)/255) if 'wall_vertices' in data.files else None
+            # Optional walls (terrain_to_render.py --walls): 4 corners per quad, coloured per vertex or
+            # (wall_uv) from the tile's wall atlas, read with nearest sampling.
+            walls=None
+            if 'wall_uv' in data.files:
+                walls=(data['wall_vertices'],None,(data['wall_uv'],args.terrain/str(data['wall_texture']),'Closest'))
+            elif 'wall_vertices' in data.files:
+                walls=(data['wall_vertices'],data['wall_rgb'].astype(float)/255,None)
         if not textured:
             ids=np.arange(rows*cols).reshape(rows,cols)
             a=ids[:-1,:-1].ravel();b=a+1;c=a+cols;d=c+1
             if face_keep is not None: a,b,c,d=a[face_keep],b[face_keep],c[face_keep],d[face_keep]
             faces=np.concatenate([np.stack([a,b,d],1),np.stack([a,d,c],1)])
-        meshes=[(tile,vertices,faces,rgb)]
+            texture=None
+        meshes=[(tile,vertices,faces,rgb,texture)]
         if walls is not None and len(walls[0]):
             q=np.arange(len(walls[0])).reshape(-1,4)
-            meshes.append((tile+'_walls',walls[0],np.concatenate([q[:,[0,1,2]],q[:,[0,2,3]]]),walls[1]))
-        for name,mesh_vertices,mesh_faces,mesh_rgb in meshes:
+            meshes.append((tile+'_walls',walls[0],np.concatenate([q[:,[0,1,2]],q[:,[0,2,3]]]),walls[1],walls[2]))
+        for name,mesh_vertices,mesh_faces,mesh_rgb,mesh_texture in meshes:
             mesh=bpy.data.meshes.new(name)
             mesh.from_pydata(mesh_vertices.tolist(),[],mesh_faces.tolist());mesh.update()
-            if mesh_rgb is None:
-                # Textured tile: one UV per face corner (loops follow the face vertex order of from_pydata).
+            if mesh_texture is not None:
+                # Textured mesh: one UV per face corner (loops follow the face vertex order of from_pydata).
+                mesh_uv,image_path,interpolation=mesh_texture
                 layer=mesh.uv_layers.new(name='UVMap')
-                layer.data.foreach_set('uv',uv[mesh_faces].astype(np.float32).ravel())
+                layer.data.foreach_set('uv',mesh_uv[mesh_faces].astype(np.float32).ravel())
                 obj=bpy.data.objects.new(name,mesh);scene.collection.objects.link(obj)
-                obj.data.materials.append(texture_material(name+'_texture',texture_path));triangles+=len(mesh_faces)
+                obj.data.materials.append(texture_material(name+'_texture',image_path,interpolation))
+                triangles+=len(mesh_faces)
                 continue
             attribute=mesh.color_attributes.new(name='Color',type='FLOAT_COLOR',domain='POINT')
             # PNG textures are sRGB; Blender FLOAT_COLOR attributes are scene linear.

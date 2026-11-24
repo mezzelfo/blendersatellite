@@ -141,7 +141,8 @@ def test_textured_composite(composite):
     from PIL import Image
     tex, old = composite['textured'], composite['out']
     frame = json.loads((tex / 'cache_frame.json').read_text())
-    assert frame['mesh'] == dict(texture_spacing_m=1.0, simplify_tolerance_m=0.25, decimate=0.5)
+    assert frame['mesh'] == dict(texture_spacing_m=1.0, simplify_tolerance_m=0.25, decimate=0.5,
+                                 wall_merge_tolerance_m=0.5)
     with np.load(old / 'B__001000.npz') as b_old, np.load(tex / 'B__001000.npz') as b:
         assert 'rgb' not in b.files and 'face_keep' not in b.files
         t = b['vertices'][b['triangles']]
@@ -149,7 +150,7 @@ def test_textured_composite(composite):
                            - (t[:, 2, 0] - t[:, 0, 0]) * (t[:, 1, 1] - t[:, 0, 1]))
         assert np.isclose(area.sum(), b_old['face_keep'].sum() * 2.5 ** 2, rtol=1e-3)
         assert len(b["triangles"]) < 0.5 * 2 * b_old['face_keep'].sum()
-        assert (b['wall_vertices'].shape == b_old['wall_vertices'].shape)
+        assert 'wall_uv' in b.files and int(b['wall_edges']) == int(b_old['wall_edges'])  # same walls, textured
         image = np.asarray(Image.open(tex / str(b['texture'])))[::-1]  # row 0 south
         assert np.all((b['uv'] >= 0) & (b['uv'] <= 1))
     # B's texture starts at x = 50 m: its first 50 columns are the strip shared with A

@@ -54,9 +54,14 @@ The textured output has the keys
   uv         float32 (V, 2), texture coordinates (0, 0) = south-west corner of the texture
   triangles  int32 (T, 3), counter-clockwise seen from above
   texture    file name of the texture image (beside the .npz), texture_spacing, shape (rows, cols
-             of the render grid), sampled_fraction, and the wall keys above (walls keep their
-             vertex colours). face_keep is applied before the simplification and not written.
-cache_frame.json records the texture and simplification settings, so the two formats never mix.
+             of the render grid), sampled_fraction. face_keep is applied before the simplification
+             and not written.
+With --walls the walls are textured too (build_wall_runs): consecutive edges on one line whose
+bottom and top heights stay within --wall-merge-tolerance (0.5 m) become one quad, coloured from a
+per-tile atlas <tile>_walls.png with one texel per edge and per render spacing in height (the
+colours of the wall segments above). Keys: wall_vertices (4 Q, 3), wall_uv (4 Q, 2), wall_texture,
+wall_segments (Q quads), wall_edges, wall_texels, wall_sources, wall_source_counts (per texel).
+cache_frame.json records the texture, simplification and wall settings, so formats never mix.
 """
 import argparse
 import json
@@ -520,11 +525,48 @@ def build_walls(tile, grids, load_voxels, spacing, threshold=2.0, all_steps=Fals
     normal (S,2), source (S,) int8 (index into SOURCES), edges, and with all_steps
     cell_quads (C,4,3), cell_rgb (C,3).
     """
+    names, owner, height, rgb, i0, j0, edge = wall_edges(tile, grids, spacing, 0. if all_steps else threshold)
+    own = owner == names.index(tile)
+    s = spacing
+    n_edges = len(edge['lo'])
+    # Vertical split into equal segments of height <= spacing.
+    dh = edge['hi'] - edge['lo']
+    n_split = np.maximum(1, np.ceil(dh / s - 1e-9).astype(np.int64))
+    eid = np.repeat(np.arange(n_edges), n_split)
+    k = np.arange(len(eid)) - np.repeat(np.cumsum(n_split) - n_split, n_split)
+    seg = {key: edge[key][eid] for key in ('xa', 'xb', 'ya', 'yb', 'nx', 'ny')}
+    seg['z0'] = edge['lo'][eid] + dh[eid] * k / n_split[eid]
+    seg['z1'] = edge['lo'][eid] + dh[eid] * (k + 1) / n_split[eid]
+    coloured = dh[eid] > threshold
+    rgb_seg = edge['low_rgb'][eid].astype(np.float64)
+    source = np.full(len(eid), 3, dtype=np.int8)
+    if coloured.any():
+        sub = {key: v[coloured] for key, v in seg.items()}
+        voxels, voxel_size = window_voxels(tile, names, owner, i0, j0, s, load_voxels)
+        colour, src = colour_segments(sub, voxels, voxel_size, s)
+        found = src < 2
+        idx = np.flatnonzero(coloured)
+        rgb_seg[idx[found]] = colour[found]
+        source[idx] = src
+    xa, xb, ya, yb, z0, z1 = (seg[key] for key in ('xa', 'xb', 'ya', 'yb', 'z0', 'z1'))
+    quads = np.stack([np.c_[xa, ya, z0], np.c_[xb, yb, z0], np.c_[xb, yb, z1], np.c_[xa, ya, z1]], 1)
+    result = dict(quads=quads, rgb=np.rint(rgb_seg).clip(0, 255).astype(np.uint8),
+                  normal=np.c_[seg['nx'], seg['ny']], source=source, edges=n_edges)
+    if all_steps:
+        r, c = np.nonzero(own)
+        x0, x1, y0, y1, z = (i0 + c) * s, (i0 + c + 1) * s, (j0 + r) * s, (j0 + r + 1) * s, height[r, c]
+        result['cell_quads'] = np.stack([np.c_[x0, y0, z], np.c_[x1, y0, z], np.c_[x1, y1, z], np.c_[x0, y1, z]], 1)
+        result['cell_rgb'] = rgb[r, c]
+    return result
+
+
+def wall_edges(tile, grids, spacing, limit):
+    """The wall edges of a tile (see build_walls): merged window (names, owner, height, rgb, i0, j0)
+    and dict of (E,) arrays xa, xb, ya, yb, lo, hi, nx, ny, low_rgb, east-west pairs first."""
     names, owner, height, rgb, i0, j0 = merged_window(tile, grids)
     me = names.index(tile)
     own = owner == me
     s = spacing
-    limit = 0. if all_steps else threshold
     parts = []
     # East-west pairs (r, c) | (r, c + 1): edge x = (i0 + c + 1) s, y in [(j0 + r) s, (j0 + r + 1) s].
     a, b = height[:, :-1], height[:, 1:]
@@ -545,48 +587,120 @@ def build_walls(tile, grids, load_voxels, spacing, threshold=2.0, all_steps=Fals
                       nx=np.zeros(len(r)), ny=np.where(south_low, -1., 1.),
                       low_rgb=np.where(south_low[:, None], rgb[r, c], rgb[r + 1, c])))
     edge = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
-    n_edges = len(edge['lo'])
-    # Vertical split into equal segments of height <= spacing.
-    dh = edge['hi'] - edge['lo']
-    n_split = np.maximum(1, np.ceil(dh / s - 1e-9).astype(np.int64))
-    eid = np.repeat(np.arange(n_edges), n_split)
-    k = np.arange(len(eid)) - np.repeat(np.cumsum(n_split) - n_split, n_split)
-    seg = {key: edge[key][eid] for key in ('xa', 'xb', 'ya', 'yb', 'nx', 'ny')}
-    seg['z0'] = edge['lo'][eid] + dh[eid] * k / n_split[eid]
-    seg['z1'] = edge['lo'][eid] + dh[eid] * (k + 1) / n_split[eid]
-    coloured = dh[eid] > threshold
-    rgb_seg = edge['low_rgb'][eid].astype(np.float64)
-    source = np.full(len(eid), 3, dtype=np.int8)
-    if coloured.any():
-        sub = {key: v[coloured] for key, v in seg.items()}
-        sets = [load_voxels(t) for t in names]
-        voxel_size = float(sets[0]['voxel'])
-        if any(abs(float(v['voxel']) - voxel_size) > 1e-9 for v in sets):
-            raise ValueError(f'Facade voxel sizes differ around {tile}')
-        # Only voxels that can reach the window (fallback radius included).
-        reach = WALL_FALLBACK_CELLS * s + voxel_size
-        x_lo, y_lo = i0 * s - reach, j0 * s - reach
-        x_hi, y_hi = (i0 + owner.shape[1]) * s + reach, (j0 + owner.shape[0]) * s + reach
-        clipped = []
-        for v in sets:
-            centre = (v['ijk'][:, :2] + .5) * voxel_size
-            keep = ((centre[:, 0] >= x_lo) & (centre[:, 0] <= x_hi) & (centre[:, 1] >= y_lo) & (centre[:, 1] <= y_hi))
-            clipped.append({key: v[key][keep] for key in ('ijk', 'rgb', 'normal', 'count')})
-        colour, src = colour_segments(sub, merge_voxels(clipped), voxel_size, s)
-        found = src < 2
-        idx = np.flatnonzero(coloured)
-        rgb_seg[idx[found]] = colour[found]
-        source[idx] = src
-    xa, xb, ya, yb, z0, z1 = (seg[key] for key in ('xa', 'xb', 'ya', 'yb', 'z0', 'z1'))
-    quads = np.stack([np.c_[xa, ya, z0], np.c_[xb, yb, z0], np.c_[xb, yb, z1], np.c_[xa, ya, z1]], 1)
-    result = dict(quads=quads, rgb=np.rint(rgb_seg).clip(0, 255).astype(np.uint8),
-                  normal=np.c_[seg['nx'], seg['ny']], source=source, edges=n_edges)
-    if all_steps:
-        r, c = np.nonzero(own)
-        x0, x1, y0, y1, z = (i0 + c) * s, (i0 + c + 1) * s, (j0 + r) * s, (j0 + r + 1) * s, height[r, c]
-        result['cell_quads'] = np.stack([np.c_[x0, y0, z], np.c_[x1, y0, z], np.c_[x1, y1, z], np.c_[x0, y1, z]], 1)
-        result['cell_rgb'] = rgb[r, c]
-    return result
+    return names, owner, height, rgb, i0, j0, edge
+
+
+WALL_ATLAS_WIDTH = 2048        # texels per row of a tile's wall atlas
+
+
+def build_wall_runs(tile, grids, load_voxels, spacing, threshold=2.0, tolerance=0.5):
+    """Textured walls of one tile, in the native CRS: the edges of build_walls merged along the
+    facades, coloured through a texture atlas.
+
+    Consecutive edges on the same line facing the same way are merged into one quad (a run)
+    while the lowest and the highest bottom heights differ by at most tolerance, and the same
+    for the top heights; the quad corners take the heights of the first and last edge, so the
+    wall stays within tolerance of every edge. Every run gets a block of the atlas, one texel per
+    edge along the wall and one per spacing in height from its lowest bottom: the texel colour is
+    that of a wall segment of build_walls at the same place (colour_segments, the lower cell where
+    no voxel is in reach), so the colours are those of the vertex-coloured walls. Blocks have a
+    one-texel border copied from their edge texels, so nearest sampling never reads a neighbour.
+    Returns quads (R,4,3) [bottom a, bottom b, top b, top a], uv (R,4,2), atlas (rows, cols, 3)
+    uint8 with row 0 at the bottom (v = 0), source (texels,) int8 (index into SOURCES), edges, texels."""
+    names, owner, height, rgb, i0, j0, edge = wall_edges(tile, grids, spacing, threshold)
+    s = spacing
+    n = len(edge['lo'])
+    if n == 0:
+        return dict(quads=np.zeros((0, 4, 3)), uv=np.zeros((0, 4, 2)), atlas=np.zeros((1, 1, 3), np.uint8),
+                    source=np.zeros(0, np.int8), edges=0, texels=0)
+    ew = edge['xa'] == edge['xb']  # walls along y (an x = const line)
+    line = np.where(ew, edge['xa'], edge['ya'])
+    along = np.where(ew, edge['ya'], edge['xa'])
+    facing = np.where(ew, edge['nx'], edge['ny'])
+    lo, hi = edge['lo'], edge['hi']
+    order = np.lexsort((along, facing, line, ~ew))
+    # Greedy runs in that order (plain Python lists: one pass over the edges).
+    o_ew, o_line, o_along, o_facing = (v[order].tolist() for v in (ew, line, along, facing))
+    o_lo, o_hi = lo[order].tolist(), hi[order].tolist()
+    starts = [0]
+    lo_min = lo_max = o_lo[0]
+    hi_min = hi_max = o_hi[0]
+    for k in range(1, n):
+        same = (o_ew[k] == o_ew[k - 1] and abs(o_line[k] - o_line[k - 1]) < 1e-6 and o_facing[k] == o_facing[k - 1]
+                and abs(o_along[k] - o_along[k - 1] - s) < 1e-6)
+        if same:
+            l0, l1 = min(lo_min, o_lo[k]), max(lo_max, o_lo[k])
+            h0, h1 = min(hi_min, o_hi[k]), max(hi_max, o_hi[k])
+            if l1 - l0 <= tolerance and h1 - h0 <= tolerance:
+                lo_min, lo_max, hi_min, hi_max = l0, l1, h0, h1
+                continue
+        starts.append(k)
+        lo_min = lo_max = o_lo[k]
+        hi_min = hi_max = o_hi[k]
+    starts = np.array(starts)
+    length = np.diff(np.r_[starts, n])
+    run = np.repeat(np.arange(len(starts)), length)             # run of every position in order
+    zmin = np.minimum.reduceat(lo[order], starts)
+    zmax = np.maximum.reduceat(hi[order], starts)
+    bands = np.maximum(1, np.ceil((zmax - zmin) / s - 1e-9).astype(np.int64))
+    # Texels: for every run, its edges (along) x its height bands; colours as wall segments.
+    per_edge = bands[run]
+    pos = np.repeat(np.arange(n), per_edge)                      # position in order of every texel
+    band = np.arange(len(pos)) - np.repeat(np.cumsum(per_edge) - per_edge, per_edge)
+    e = order[pos]
+    seg = {key: edge[key][e] for key in ('xa', 'xb', 'ya', 'yb', 'nx', 'ny')}
+    seg['z0'] = zmin[run[pos]] + band * s
+    seg['z1'] = np.minimum(seg['z0'] + s, zmax[run[pos]])
+    voxels, voxel_size = window_voxels(tile, names, owner, i0, j0, s, load_voxels)
+    colour, source = colour_segments(seg, voxels, voxel_size, s)
+    found = source < 2
+    texel = np.where(found[:, None], colour, edge['low_rgb'][e]).astype(np.float64)
+    texel = np.rint(texel).clip(0, 255).astype(np.uint8)
+    # Shelf packing of the blocks (border of one texel), tallest first.
+    w, h = length + 2, bands + 2
+    width = int(min(WALL_ATLAS_WIDTH, max(w.max(), w.sum())))
+    ox, oy = np.zeros(len(w), np.int64), np.zeros(len(w), np.int64)
+    x = y = shelf = 0
+    for r in np.argsort(-h, kind='stable').tolist():
+        if x + w[r] > width:
+            y, x, shelf = y + shelf, 0, 0
+        ox[r], oy[r] = x, y
+        x, shelf = x + w[r], max(shelf, int(h[r]))
+    atlas = np.zeros((y + shelf, width, 3), np.uint8)
+    first = np.r_[0, np.cumsum(length * bands)[:-1]]           # first texel of every run
+    for r in range(len(starts)):
+        block = texel[first[r]:first[r] + length[r] * bands[r]].reshape(length[r], bands[r], 3).transpose(1, 0, 2)
+        atlas[oy[r]:oy[r] + h[r], ox[r]:ox[r] + w[r]] = np.pad(block, ((1, 1), (1, 1), (0, 0)), mode='edge')
+    # One quad per run, corners at the first and last edge.
+    e0, e1 = order[starts], order[starts + length - 1]
+    a0, a1 = along[e0], along[e1] + s
+    ln = line[e0]
+    xa, xb = np.where(ew[e0], ln, a0), np.where(ew[e0], ln, a1)
+    ya, yb = np.where(ew[e0], a0, ln), np.where(ew[e0], a1, ln)
+    quads = np.stack([np.c_[xa, ya, lo[e0]], np.c_[xb, yb, lo[e1]], np.c_[xb, yb, hi[e1]], np.c_[xa, ya, hi[e0]]], 1)
+    u0, u1 = (ox + 1) / width, (ox + 1 + length) / width
+    v = lambda z: (oy + 1 + (z - zmin) / s) / atlas.shape[0]  # noqa: E731
+    uv = np.stack([np.c_[u0, v(lo[e0])], np.c_[u1, v(lo[e1])], np.c_[u1, v(hi[e1])], np.c_[u0, v(hi[e0])]], 1)
+    return dict(quads=quads, uv=uv, atlas=atlas, source=source, edges=n, texels=len(pos))
+
+
+def window_voxels(tile, names, owner, i0, j0, spacing, load_voxels):
+    """Facade voxels of every tile of the window that can reach it (fallback radius included),
+    merged (merge_voxels), and the voxel size."""
+    s = spacing
+    sets = [load_voxels(t) for t in names]
+    voxel_size = float(sets[0]['voxel'])
+    if any(abs(float(v['voxel']) - voxel_size) > 1e-9 for v in sets):
+        raise ValueError(f'Facade voxel sizes differ around {tile}')
+    reach = WALL_FALLBACK_CELLS * s + voxel_size
+    x_lo, y_lo = i0 * s - reach, j0 * s - reach
+    x_hi, y_hi = (i0 + owner.shape[1]) * s + reach, (j0 + owner.shape[0]) * s + reach
+    clipped = []
+    for v in sets:
+        centre = (v['ijk'][:, :2] + .5) * voxel_size
+        keep = ((centre[:, 0] >= x_lo) & (centre[:, 0] <= x_hi) & (centre[:, 1] >= y_lo) & (centre[:, 1] <= y_hi))
+        clipped.append({key: v[key][keep] for key in ('ijk', 'rgb', 'normal', 'count')})
+    return merge_voxels(clipped), voxel_size
 
 
 def facade_loader(cache_dir, maxsize=32):
@@ -649,7 +763,18 @@ def convert_tile(grid, output, manifest, dataset, target, walls=None, face_keep=
     h, rgb = grid['height'], grid['rgb']
     rows, cols = h.shape
     extra = {}
-    if walls is not None:
+    if walls is not None and 'uv' in walls:  # textured walls (build_wall_runs)
+        n = len(walls['quads'])
+        wall_name = output.stem + '_walls.png'
+        part = output.parent / (wall_name + '.part')
+        Image.fromarray(np.ascontiguousarray(walls['atlas'][::-1])).save(part, format='PNG', compress_level=3)
+        part.replace(output.parent / wall_name)
+        extra = dict(wall_vertices=to_local(walls['quads'].reshape(-1, 3), manifest, dataset).astype(np.float32),
+                     wall_uv=walls['uv'].reshape(-1, 2).astype(np.float32), wall_texture=wall_name,
+                     wall_segments=n, wall_edges=walls['edges'], wall_texels=walls['texels'],
+                     wall_sources=np.array(SOURCES),
+                     wall_source_counts=np.bincount(walls['source'], minlength=len(SOURCES)))
+    elif walls is not None:
         n = len(walls['quads'])
         counts = np.bincount(walls['source'], minlength=len(SOURCES))
         extra = dict(wall_vertices=to_local(walls['quads'].reshape(-1, 3), manifest, dataset).astype(np.float32),
@@ -720,6 +845,9 @@ def main():
     parser.add_argument('--simplify-tolerance', type=float, default=0.,
                         help='merge grid blocks whose vertices lie within this height (m) of a plane '
                              '(needs --texture-spacing); 0: no merging')
+    parser.add_argument('--wall-merge-tolerance', type=float, default=0.5,
+                        help='with --walls and --texture-spacing: merge consecutive wall edges whose bottom and top '
+                             'heights stay within this range (m) into one textured quad')
     parser.add_argument('--decimate', type=float, default=1.,
                         help='keep about this fraction of each tile\'s terrain triangles by quadric error decimation '
                              '(pyfqmr; needs --texture-spacing); 1: no decimation')
@@ -747,6 +875,8 @@ def main():
         frame['mesh'] = dict(texture_spacing_m=args.texture_spacing, simplify_tolerance_m=args.simplify_tolerance)
         if args.decimate < 1:
             frame['mesh']['decimate'] = args.decimate
+        if args.walls:
+            frame['mesh']['wall_merge_tolerance_m'] = args.wall_merge_tolerance
     corrections = {}
     if members:  # composite: one entry per member tile, member caches beside the composite folder
         caches = member_cache_dirs(args.cache, members)
@@ -809,7 +939,11 @@ def main():
             done += 1
         else:
             grid = grids[out] if grids else render_grid(source, target)
-            walls = build_walls(out, grids, load_voxels, target, args.wall_threshold) if args.walls else None
+            walls = None
+            if args.walls and args.texture_spacing:
+                walls = build_wall_runs(out, grids, load_voxels, target, args.wall_threshold, args.wall_merge_tolerance)
+            elif args.walls:
+                walls = build_walls(out, grids, load_voxels, target, args.wall_threshold)
             face_keep = face_keep_of(composite_keep(out, grids)) if members else None
             texture = None
             if args.texture_spacing:
@@ -825,7 +959,14 @@ def main():
                 print(f'{out}: {n_triangles:,} terrain triangles ({n_triangles / max(full, 1):.1%} of the '
                       f'{full:,} of the drawn grid), texture {texture[0].shape[1]} x {texture[0].shape[0]} '
                       f'at {args.texture_spacing:g} m', flush=True)
-            if walls is not None:
+            if walls is not None and 'uv' in walls:
+                wall_triangles += 2 * len(walls['quads'])
+                sources += np.bincount(walls['source'], minlength=len(SOURCES))
+                print(f'{out}: {walls["edges"]:,} wall edges in {len(walls["quads"]):,} textured quads, atlas '
+                      f'{walls["atlas"].shape[1]} x {walls["atlas"].shape[0]} ({walls["texels"]:,} texels: '
+                      f'{", ".join(f"{n} {k}" for k, n in zip(SOURCES, np.bincount(walls["source"], minlength=len(SOURCES))))})',
+                      flush=True)
+            elif walls is not None:
                 wall_triangles += 2 * len(walls['quads'])
                 sources += np.bincount(walls['source'], minlength=len(SOURCES))
                 print(f'{out}: {walls["edges"]:,} wall edges, {len(walls["quads"]):,} segments '
@@ -843,7 +984,7 @@ def main():
           f'{kept} already present; {done + kept} tiles, {vertices:,} vertices, '
           f'{triangles:,} triangles -> {args.output}')
     if args.walls and not args.dry_run:
-        print(f'walls: {wall_triangles // 2:,} segments, {wall_triangles:,} triangles; segment colour from '
+        print(f'walls: {wall_triangles // 2:,} quads, {wall_triangles:,} triangles; colour (segments or texels) from '
               + ', '.join(f'{k} {n:,}' for k, n in zip(SOURCES, sources)))
     if missing:
         raise SystemExit(f'{len(missing)} selected tiles missing from the cache: {missing[:10]}...')

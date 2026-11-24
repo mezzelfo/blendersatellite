@@ -725,3 +725,92 @@ def test_mesh_store_keeps_and_reuses_archives(tmp_path, monkeypatch):
     (out / '668490x2.npz').unlink()
     second = tc.process_tile('test', dataset, '668490x2', out, 2.0, 2, None, False, 1.0, bounds, store)
     assert len(calls) == 1 and second['downloaded_bytes'] == 0 and (store / '668490x2.zip').exists()
+
+
+def native_wall_runs(walls_built, tolerance=0.5):
+    """build_wall_runs on the native grids of the three tiles (terrain_to_render.py --walls --texture-spacing)."""
+    from terrain_to_render import build_wall_runs, facade_loader, render_grid
+    cache = walls_built['cache'] / '1m'
+    grids = {t: render_grid(cache / f'{t}.npz', 2.5) for t in walls_built['tiles']}
+    load = facade_loader(cache)
+    return {t: build_wall_runs(t, grids, load, 2.5, 2.0, tolerance) for t in walls_built['tiles']}
+
+
+def run_texels(runs, r):
+    """Texel block (bands, edges, 3) of run r, bottom row first, from its uv and the atlas."""
+    atlas = runs['atlas']
+    rows, cols = atlas.shape[:2]
+    uv = runs['uv'][r]
+    c0, c1 = int(round(uv[0, 0] * cols)), int(round(uv[1, 0] * cols))
+    r0 = int(round(uv[0, 1] * rows))
+    bands = int(round((runs['quads'][r, 3, 2] - runs['quads'][r, 0, 2]) / 2.5))
+    return atlas[r0:r0 + bands, c0:c1]
+
+
+def test_wall_runs_one_quad_per_facade(walls_built):
+    """The building's four facades (flat ground, flat roof) become four quads, each 20 m long and
+    from the ground to the roof; the texels have the facade colours of the vertex-coloured walls."""
+    runs = native_wall_runs(walls_built)['WALLS']
+    q = runs['quads'] - [X0, Y0 + WALLS_DY, 0]
+    assert runs['edges'] == 4 * 8 and len(q) == 4 and runs['texels'] == 4 * 8 * 12
+    assert np.allclose(q[:, 0, 2], 0) and np.allclose(q[:, 2, 2], ROOF)
+    assert np.allclose(np.linalg.norm(q[:, 1, :2] - q[:, 0, :2], axis=1), B1 - B0)
+    assert (runs['source'] == 0).all()
+    for r in range(4):
+        block = run_texels(runs, r).astype(int)
+        assert block.shape == (12, 8, 3)
+        north = np.allclose(q[r, :2, 1], B1)
+        if north:  # red below the split (15 m = 6 bands), green above
+            assert np.abs(block[:6] - COLOURS['red']).max() <= 1 and np.abs(block[6:] - COLOURS['green']).max() <= 1
+        else:
+            assert np.abs(block - COLOURS['blue']).max() <= 1
+
+
+def test_wall_runs_match_wall_segments(walls_built):
+    """Every texel equals the colour of the wall segment of build_walls at the same place (the
+    bands coincide here: 30 m walls, 12 segments of 2.5 m)."""
+    native, runs = native_walls(walls_built), native_wall_runs(walls_built)
+    for tile in walls_built['tiles']:
+        seg, run = native[tile], runs[tile]
+        centre = seg['quads'].mean(1)
+        matched = 0
+        for r in range(len(run['quads'])):
+            a, b = run['quads'][r, 0], run['quads'][r, 1]
+            block = run_texels(run, r)
+            direction = (b[:2] - a[:2]) / np.linalg.norm(b[:2] - a[:2])
+            t = (centre[:, :2] - a[:2]) @ direction
+            off = np.abs((centre[:, :2] - a[:2]) @ np.array([-direction[1], direction[0]]))
+            mine = (off < 1e-6) & (t > 0) & (t < np.linalg.norm(b[:2] - a[:2]))
+            k = np.floor(t[mine] / 2.5).astype(int)
+            m = np.floor((centre[mine, 2] - a[2]) / 2.5).astype(int)
+            assert np.array_equal(block[m, k], seg['rgb'][mine]), tile
+            matched += mine.sum()
+        assert matched == len(seg['quads']), tile  # every segment found in exactly one run
+    assert len(runs['SEAM_W']['quads']) == 1 and runs['SEAM_W']['edges'] == 8  # the seam wall, built once
+
+
+def test_wall_runs_split_on_height_change(walls_built):
+    """With a zero tolerance only edges of exactly equal heights are merged; the number of quads can
+    only grow, the texels stay the same."""
+    loose, strict = native_wall_runs(walls_built, 0.5), native_wall_runs(walls_built, 0.)
+    for tile in walls_built['tiles']:
+        assert len(strict[tile]['quads']) >= len(loose[tile]['quads'])
+        assert strict[tile]['texels'] == loose[tile]['texels'] and strict[tile]['edges'] == loose[tile]['edges']
+
+
+def test_render_npz_textured_walls(walls_built, tmp_path):
+    out = tmp_path / 'render_textured'
+    run(ROOT / 'pipeline' / 'terrain_to_render.py', '--cameras', walls_built['cameras'], '--cache',
+        walls_built['cache'] / '1m', '--dataset', 'melbourne_2020', '--output', out, '--walls',
+        '--texture-spacing', 1, '--decimate', 0.5)
+    runs = native_wall_runs(walls_built)
+    for tile in walls_built['tiles']:
+        with np.load(out / f'{tile}.npz') as a:
+            n = len(runs[tile]['quads'])
+            assert int(a['wall_segments']) == n and a['wall_vertices'].shape == (4 * n, 3)
+            assert a['wall_uv'].shape == (4 * n, 2) and np.all((a['wall_uv'] >= 0) & (a['wall_uv'] <= 1))
+            assert 'wall_rgb' not in a.files
+            atlas = np.asarray(Image.open(out / str(a['wall_texture'])))[::-1]
+            assert np.array_equal(atlas, runs[tile]['atlas'])
+    frame = json.loads((out / 'cache_frame.json').read_text())
+    assert frame['mesh'] == dict(texture_spacing_m=1.0, simplify_tolerance_m=0.0, decimate=0.5, wall_merge_tolerance_m=0.5)

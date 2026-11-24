@@ -200,7 +200,11 @@ where a small horizontal shift is a large height difference. `--simplify-toleran
 aligned square blocks within E m of a plane, is kept but weaker on these meshes (57 to 74 % of the
 triangles left for E = 1.5 to 0.25 m). `run_swarm.sh` uses `TERRAIN_TEXTURE=1` (the cache spacing)
 and `TERRAIN_DECIMATE=0.15` by default; `TERRAIN_TEXTURE=0` gives the former vertex-coloured grid.
-Walls are unchanged (vertex colours, segments of at most one render cell).
+With `--walls` the walls are textured as well: consecutive wall edges on one line whose bottom
+and top heights stay within `--wall-merge-tolerance` (0.5 m) become one quad, coloured from a
+per-tile atlas (`<tile>_walls.png`, one texel per edge and per render spacing in height, the
+colours of the former wall segments, read with nearest sampling). A flat-roofed facade of n
+edges and k segments per edge goes from n k quads to one.
 `render_swarm.py` reads either format; `cache_frame.json` keeps them apart.
 
 #### Composite terrain (adjacent datasets)
