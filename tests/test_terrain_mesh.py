@@ -152,3 +152,28 @@ def test_texture_orientation_and_placement(tmp_path):
     expected = 4 * (vx - x0 - .5)  # R = 4 x (cell index) at the cell centres, linear in x
     assert np.abs(sampled - expected)[inside].max() < 1.01
     assert abs((image[rr, cc[10], 1] * (1 - fv) + image[rr + 1, cc[10], 1] * fv)[5] - 4 * (vy[5] - y0 - .5)) < 1.01
+
+
+def test_decimation_keeps_outline_and_orientation(simplified):
+    """Quadric decimation of the full city grid with a hole: about the asked fraction of triangles,
+    the drawn area and every border vertex (grid border and hole edge) unchanged, no flipped
+    triangle, the surface close to the grid on most vertices."""
+    pytest.importorskip('pyfqmr')
+    h, drawable = simplified['h'], simplified['drawable']
+    rows, cols = h.shape
+    triangles, (ids, _) = ttr.simplify_grid(h, drawable, 0.)
+    r, c = np.divmod(ids, cols)
+    xyz = np.c_[c, r, h.ravel()[ids]].astype(float)
+    v, f = ttr.decimate_mesh(xyz, triangles, 0.2)
+    assert len(f) <= 0.21 * len(triangles)
+    t = v[f]
+    area = .5 * ((t[:, 1, 0] - t[:, 0, 0]) * (t[:, 2, 1] - t[:, 0, 1]) - (t[:, 2, 0] - t[:, 0, 0]) * (t[:, 1, 1] - t[:, 0, 1]))
+    assert area.min() > 0 and np.isclose(area.sum(), drawable.sum())
+    edges = np.sort(np.concatenate([triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]]), 1)
+    unique, count = np.unique(edges, axis=0, return_counts=True)
+    border = {tuple(p) for p in xyz[np.unique(unique[count == 1])]}
+    assert border <= {tuple(p) for p in v}
+    y, x = np.mgrid[0:rows, 0:cols]
+    z = surface_at(t, x.ravel().astype(float), y.ravel().astype(float))
+    drawn = np.isfinite(z)
+    assert np.median(np.abs(z - h.ravel())[drawn]) < 0.1

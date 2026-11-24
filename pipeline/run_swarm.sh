@@ -24,15 +24,16 @@ case "$WALLS" in
     *) echo "WALLS must be 0 or 1, not '$WALLS'" >&2; exit 1 ;;
 esac
 # Terrain mesh (terrain_to_render.py): TERRAIN_TEXTURE texel size in metres of the per-tile terrain
-# texture (default 1, the cache spacing; 0 = colours on the vertices as before), TERRAIN_SIMPLIFY
-# height tolerance in metres for merging flat grid blocks (default 0.25; 0 = full grid).
+# texture (default 1, the cache spacing; 0 = colours on the vertices as before), TERRAIN_DECIMATE
+# fraction of the terrain triangles kept by quadric error decimation (default 0.15, needs pyfqmr;
+# 1 = full grid).
 TERRAIN_TEXTURE="${TERRAIN_TEXTURE:-1}"
-TERRAIN_SIMPLIFY="${TERRAIN_SIMPLIFY:-0.25}"
+TERRAIN_DECIMATE="${TERRAIN_DECIMATE:-0.15}"
 MESH_OPTS=()
 if [[ "$TERRAIN_TEXTURE" != 0 ]]; then
-    MESH_OPTS=(--texture-spacing "$TERRAIN_TEXTURE" --simplify-tolerance "$TERRAIN_SIMPLIFY")
-elif [[ "$TERRAIN_SIMPLIFY" != 0 ]]; then
-    echo "TERRAIN_SIMPLIFY needs a texture (TERRAIN_TEXTURE > 0): merged cells would lose their colours" >&2; exit 1
+    MESH_OPTS=(--texture-spacing "$TERRAIN_TEXTURE" --decimate "$TERRAIN_DECIMATE")
+elif [[ "$TERRAIN_DECIMATE" != 1 ]]; then
+    echo "TERRAIN_DECIMATE needs a texture (TERRAIN_TEXTURE > 0): merged cells would lose their colours" >&2; exit 1
 fi
 # Blender engine (ENGINE, default EEVEE): passed as --engine unless the arguments already give one.
 ENGINE="${ENGINE:-EEVEE}"
@@ -103,7 +104,7 @@ else
     echo "Terrain: cache spacing $TERRAIN_SPACING m, walls OFF (WALLS=0, grid only)"
 fi
 if [[ "$TERRAIN_TEXTURE" != 0 ]]; then
-    echo "Terrain mesh: texture $TERRAIN_TEXTURE m, flat blocks merged within $TERRAIN_SIMPLIFY m"
+    echo "Terrain mesh: texture $TERRAIN_TEXTURE m, decimated to $TERRAIN_DECIMATE of the grid triangles"
 else
     echo "Terrain mesh: vertex colours, full grid (TERRAIN_TEXTURE=0)"
 fi

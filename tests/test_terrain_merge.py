@@ -76,7 +76,8 @@ def composite(tmp_path_factory):
     textured = tmp / 'render_textured'
     subprocess.run([sys.executable, str(ROOT / 'pipeline' / 'terrain_to_render.py'), '--cameras', str(cameras),
                     '--cache', str(root / 'AB' / '1m'), '--dataset', 'AB', '--output', str(textured),
-                    '--datasets', str(datasets_path), '--walls', '--texture-spacing', '1', '--simplify-tolerance', '0.25'],
+                    '--datasets', str(datasets_path), '--walls', '--texture-spacing', '1', '--simplify-tolerance', '0.25',
+                    '--decimate', '0.5'],
                    check=True, capture_output=True, text=True)
     return dict(model=model, out=out, textured=textured, a_rgb=a_rgb)
 
@@ -140,7 +141,7 @@ def test_textured_composite(composite):
     from PIL import Image
     tex, old = composite['textured'], composite['out']
     frame = json.loads((tex / 'cache_frame.json').read_text())
-    assert frame['mesh'] == dict(texture_spacing_m=1.0, simplify_tolerance_m=0.25)
+    assert frame['mesh'] == dict(texture_spacing_m=1.0, simplify_tolerance_m=0.25, decimate=0.5)
     with np.load(old / 'B__001000.npz') as b_old, np.load(tex / 'B__001000.npz') as b:
         assert 'rgb' not in b.files and 'face_keep' not in b.files
         t = b['vertices'][b['triangles']]

@@ -43,9 +43,12 @@ tiles.json in the output folder lists the converted tiles (render_swarm.py loads
 RGB image <tile>_texture.png of the cache colours binned to T metres (the cache spacing, 1 m, by
 default in run_swarm.sh), over the extent of its render grid, empty texels filled from the
 nearest covered one; the vertices carry texture coordinates instead of colours. With the colour
-in the texture the geometry can be simplified without losing colour detail: --simplify-tolerance
-E (metres, needs --texture-spacing) replaces aligned square blocks of 2 to 128 grid quads whose
-vertices lie within E of their least-squares plane by a fan of triangles (see simplify_grid).
+in the texture the geometry can be simplified without losing colour detail: --decimate R (needs
+--texture-spacing) reduces every tile's terrain to the fraction R of its triangles by quadric
+error decimation (pyfqmr), with the open borders kept (tile border, cells of another member), so
+neighbouring tiles still share their border vertices. --simplify-tolerance E is the earlier,
+weaker method: aligned square blocks of 2 to 128 grid quads within E of a plane (simplify_grid);
+on the Helsinki and Espoo meshes it kept 57 to 74 % of the triangles for E = 1.5 to 0.25 m.
 The textured output has the keys
   vertices   float32 (V, 3), local frame
   uv         float32 (V, 2), texture coordinates (0, 0) = south-west corner of the texture
@@ -279,6 +282,19 @@ def simplify_grid(height, drawable, tolerance, levels=SIMPLIFY_LEVELS):
     out = np.where(tris >= 0, remap[np.maximum(tris, 0)], len(grid_used) + (-1 - tris))
     centres = np.concatenate(centres) if centres else np.zeros((0, 3))
     return out, (grid_used, centres)
+
+
+def decimate_mesh(xyz, triangles, ratio, aggressiveness=7.):
+    """Quadric error decimation (pyfqmr) of a terrain mesh to about ratio of its triangles. Open
+    border vertices are kept, so the outline (tile border, holes, cells of another member) and the
+    vertices shared with the neighbouring tiles do not move. Returns (xyz, triangles)."""
+    import pyfqmr
+    simplifier = pyfqmr.Simplify()
+    simplifier.setMesh(np.asarray(xyz, np.float64), np.asarray(triangles, np.int32))
+    simplifier.simplify_mesh(target_count=max(1, int(round(ratio * len(triangles)))),
+                             aggressiveness=aggressiveness, preserve_border=True, verbose=False)
+    vertices, faces, _ = simplifier.getMesh()
+    return np.asarray(vertices, np.float64), np.asarray(faces, np.int64)
 
 
 def to_local(xyz, manifest, dataset):
@@ -623,11 +639,12 @@ def face_keep_of(keep):
 # ----------------------------------------------------------------------------- output
 
 def convert_tile(grid, output, manifest, dataset, target, walls=None, face_keep=None, texture=None,
-                 tolerance=0.):
+                 tolerance=0., decimate=1.):
     """Write the render .npz of one tile from its render_grid (and build_walls result).
 
     texture: (image, tx0, ty0, texel) from render_texture, for the textured format (written as
-    <output stem>_texture.png), with the grid simplified by simplify_grid(tolerance).
+    <output stem>_texture.png), with the grid simplified by simplify_grid(tolerance) and then
+    decimated to the fraction decimate of its triangles (decimate_mesh).
     Returns rows, cols of the render grid and the number of terrain triangles."""
     h, rgb = grid['height'], grid['rgb']
     rows, cols = h.shape
@@ -645,9 +662,12 @@ def convert_tile(grid, output, manifest, dataset, target, walls=None, face_keep=
         r, c = np.divmod(ids, cols)
         grid_rc = np.c_[r, c, h.ravel()[ids]]
         rcz = np.concatenate([grid_rc, centres]) if len(centres) else grid_rc
-        x = grid['x0'] + (rcz[:, 1] + .5) * target
-        y = grid['y0'] + (rcz[:, 0] + .5) * target
-        local = to_local(np.c_[x, y, rcz[:, 2]], manifest, dataset)
+        # metres from the tile corner (small numbers: the decimation works in float64 anyway)
+        xyz = np.c_[(rcz[:, 1] + .5) * target, (rcz[:, 0] + .5) * target, rcz[:, 2]]
+        if decimate < 1 and len(triangles):
+            xyz, triangles = decimate_mesh(xyz, triangles, decimate)
+        x, y = grid['x0'] + xyz[:, 0], grid['y0'] + xyz[:, 1]
+        local = to_local(np.c_[x, y, xyz[:, 2]], manifest, dataset)
         uv = np.c_[(x - tx0) / (image.shape[1] * texel), (y - ty0) / (image.shape[0] * texel)]
         name = output.stem + '_texture.png'
         part = output.parent / (name + '.part')
@@ -700,13 +720,18 @@ def main():
     parser.add_argument('--simplify-tolerance', type=float, default=0.,
                         help='merge grid blocks whose vertices lie within this height (m) of a plane '
                              '(needs --texture-spacing); 0: no merging')
+    parser.add_argument('--decimate', type=float, default=1.,
+                        help='keep about this fraction of each tile\'s terrain triangles by quadric error decimation '
+                             '(pyfqmr; needs --texture-spacing); 1: no decimation')
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--dry-run', action='store_true', help='report what would be converted, write nothing')
     parser.add_argument('--datasets', type=Path, help='terrain_datasets.json to use (default: the repository one)')
     args = parser.parse_args()
 
-    if args.simplify_tolerance > 0 and not args.texture_spacing:
-        parser.error('--simplify-tolerance needs --texture-spacing (the colours of merged cells would be lost)')
+    if (args.simplify_tolerance > 0 or args.decimate < 1) and not args.texture_spacing:
+        parser.error('--simplify-tolerance and --decimate need --texture-spacing (merged cells would lose their colours)')
+    if not 0 < args.decimate <= 1:
+        parser.error('--decimate must be in (0, 1]')
     if args.output is None:
         args.output = args.cameras.resolve().parent.parent / 'terrain_render'
     manifest = json.loads(args.cameras.read_text())
@@ -720,6 +745,8 @@ def main():
                               fallback_cells=WALL_FALLBACK_CELLS)
     if args.texture_spacing:
         frame['mesh'] = dict(texture_spacing_m=args.texture_spacing, simplify_tolerance_m=args.simplify_tolerance)
+        if args.decimate < 1:
+            frame['mesh']['decimate'] = args.decimate
     corrections = {}
     if members:  # composite: one entry per member tile, member caches beside the composite folder
         caches = member_cache_dirs(args.cache, members)
@@ -789,7 +816,7 @@ def main():
                 image, tx0, ty0 = render_texture(source, grid, target, args.texture_spacing, corrections.get(m))
                 texture = (image, tx0, ty0, args.texture_spacing)
             rows, cols, n_triangles = convert_tile(grid, destination, manifest, datasets[m], target, walls, face_keep,
-                                                   texture, args.simplify_tolerance)
+                                                   texture, args.simplify_tolerance, args.decimate)
             if face_keep is not None:
                 quads = int(face_keep.sum())
                 print(f'{out}: {quads:,} of {face_keep.size:,} grid quads drawn', flush=True)
