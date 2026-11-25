@@ -1,0 +1,18 @@
+{
+  "name": "hex7_async_20deg_1550",
+  "description": "hex7_async_20deg (orbits/data/acquisitions) with 1550 frames per role: with 32 bands packed every 16 detector rows (RAW_BAND_PITCH=16, 504 rows) about 1000 ground lines are seen by every band, the ground advancing about 0.98 to 0.99 rows per frame at the nominal frame period.",
+  "formation_file": "roe_hex7_dmax1km.json",
+  "mode": "async",
+  "incidence_deg": 20.0,
+  "roles": {
+    "1": "fore",
+    "2": "nadir",
+    "3": "aft",
+    "4": "fore",
+    "5": "nadir",
+    "6": "aft"
+  },
+  "line_rule": "ground_motion",
+  "frame_period": "nominal",
+  "n_frames": 1550
+}

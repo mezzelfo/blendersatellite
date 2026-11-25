@@ -331,6 +331,13 @@ again resumes from `raw/progress.json` (extracted (satellite, frame) pairs under
 Example: `ACQUISITION=hex7_async_10deg.json RENDER_MODE=raw bash pipeline/run_swarm.sh --engine EEVEE`.
 Do not pass `--frames` or `--satellites` in this mode.
 `RAW_KEEP_FRAMES=1` extracts the raw rows but keeps every PNG (no deletion).
+By default the bands are spread over every detector row that sees the scene. On a terrain that
+covers the whole frame (Helsinki + Espoo) that is about 3000 rows, more than the ground advances in
+1000 frames (about 990 rows), so no ground line is seen by every band and `build_cubes.py` finds no
+complete line. `RAW_BAND_PITCH=16` packs the bands every 16 rows around the optical centre (504
+rows for 32 bands of 8); with `ACQUISITION=hex7_async_20deg_1550.json` (`acquisitions/` of this
+repository, 1550 frames) about 1000 lines are then seen by every band. Complete lines are about
+(rows advanced per frame x frames) - (rows spanned by the bands).
 `RAW_BLOCK` is gone (replaced by `RENDER_CHUNK`).
 `pipeline/build_cubes.py --run RUN --layout raw_bands --mode none|linear|bilinear --source raw|png`
 builds the cubes on the ground from either source (identical results); `bilinear` follows the

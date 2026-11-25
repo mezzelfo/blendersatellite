@@ -126,11 +126,16 @@ def extract_task(job):
                 verify_s=t_verify - t_write, delete_s=t_end - t_verify, total_s=t_end - t0)
 
 
-def select_band_rows(row_ok, n_bands, tdi_rows, align=4):
+def select_band_rows(row_ok, n_bands, tdi_rows, align=4, pitch=None):
     """Band start rows and stored rows from a boolean mask of usable detector rows.
 
     The longest run of usable rows [r0, r1] hosts n_bands bands of tdi_rows adjacent rows, start
-    rows multiples of `align`, spread evenly from the first to the last possible start."""
+    rows multiples of `align`, spread evenly from the first to the last possible start. With pitch
+    (rows between consecutive band starts, a multiple of align) the bands are instead packed
+    around the optical centre (the middle detector row), so they span (n_bands - 1) * pitch +
+    tdi_rows rows: a ground line is seen by every band when the ground advances over more rows
+    than that during the frames, which the spread layout does not allow on a scene covering the
+    whole frame."""
     idx = np.flatnonzero(row_ok)
     if idx.size == 0:
         raise ValueError('no detector row sees the scene in every checked frame')
@@ -141,12 +146,25 @@ def select_band_rows(row_ok, n_bands, tdi_rows, align=4):
     hi = (r1 - tdi_rows + 1) // align * align
     if hi < lo:
         raise ValueError(f'usable rows {r0}..{r1} too few for one band of {tdi_rows} rows')
-    starts = (np.round(np.linspace(lo, hi, n_bands) / align) * align).astype(int)
+    if pitch:
+        if pitch % align or pitch < tdi_rows:
+            raise ValueError(f'band pitch {pitch} must be a multiple of {align} and at least {tdi_rows} rows')
+        span = (n_bands - 1) * pitch + tdi_rows
+        centre = (len(row_ok) - 1) / 2
+        first = int(round((centre - (span - 1) / 2) / align)) * align
+        starts = first + pitch * np.arange(n_bands)
+        if starts[0] < lo or starts[-1] > hi:
+            raise ValueError(f'{n_bands} bands every {pitch} rows around row {centre:g} leave the usable rows {r0}..{r1}')
+    else:
+        starts = (np.round(np.linspace(lo, hi, n_bands) / align) * align).astype(int)
     if n_bands > 1 and np.min(np.diff(starts)) < tdi_rows:
         raise ValueError(f'usable rows {r0}..{r1} too few for {n_bands} bands of {tdi_rows} rows')
     rows = (starts[:, None] + np.arange(tdi_rows)[None]).ravel()
-    return dict(usable_rows=[r0, r1], band_start_rows=starts.tolist(), rows=rows.tolist(),
-                n_bands=n_bands, tdi_rows=tdi_rows, start_row_alignment=align)
+    out = dict(usable_rows=[r0, r1], band_start_rows=starts.tolist(), rows=rows.tolist(),
+               n_bands=n_bands, tdi_rows=tdi_rows, start_row_alignment=align)
+    if pitch:
+        out['band_pitch'] = int(pitch)
+    return out
 
 
 def frame_times(manifest, sat):
@@ -193,7 +211,7 @@ def compute_bands(args, sats, n_frames, size, ref_dir):
         idx = np.flatnonzero(sat_ok)
         per_sat[str(s)] = [int(idx[0]), int(idx[-1])] if idx.size else None
         ok &= sat_ok
-    bands = select_band_rows(ok, args.n_bands, args.tdi_rows)
+    bands = select_band_rows(ok, args.n_bands, args.tdi_rows, pitch=getattr(args, 'band_pitch', None))
     bands.update(satellites=sats, n_frames=n_frames, rows_per_satellite=per_sat,
                  criterion='alpha > 0 in at least one column, in frames 0 and F-1, for every satellite; '
                            'longest run of such rows',
@@ -214,6 +232,9 @@ def main():
     ap.add_argument('--satellites', default=None, help='comma-separated ids; default all in cameras.json')
     ap.add_argument('--n-bands', type=int, default=32)
     ap.add_argument('--tdi-rows', type=int, default=8)
+    ap.add_argument('--band-pitch', type=int, default=None,
+                    help='rows between band starts, bands packed around the optical centre (multiple of 4); '
+                         'default: bands spread over all the rows that see the scene')
     ap.add_argument('--ref-every', type=int, default=100)
     ap.add_argument('--workers', type=int, default=None,
                     help='extraction processes; default the cores not taken by render workers')

@@ -145,3 +145,19 @@ def test_keep_frames(tmp_path):
         for k in range(F):
             np.testing.assert_array_equal(D[:, k], truth(s, k)[rows])
     assert not (tmp_path / 'run' / 'reference_frames').exists()
+
+
+def test_select_band_rows_with_pitch():
+    """Bands packed around the optical centre: fixed pitch, centred, inside the usable rows."""
+    ok = np.ones(3072, bool)
+    b = rr.select_band_rows(ok, 32, 8, pitch=16)
+    starts = np.array(b['band_start_rows'])
+    assert np.all(np.diff(starts) == 16) and np.all(starts % 4 == 0) and b['band_pitch'] == 16
+    centre = (starts[0] + starts[-1] + 7) / 2
+    assert abs(centre - 1535.5) <= 2
+    assert b['rows'] == [int(s + i) for s in starts for i in range(8)]
+    with pytest.raises(ValueError):
+        rr.select_band_rows(ok, 32, 8, pitch=10)       # not a multiple of 4
+    narrow = np.zeros(3072, bool); narrow[1400:1700] = True
+    with pytest.raises(ValueError):
+        rr.select_band_rows(narrow, 32, 8, pitch=16)   # 504 rows do not fit in 300

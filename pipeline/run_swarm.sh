@@ -59,6 +59,13 @@ TRAIN_SPACING_M="${TRAIN_SPACING_M:-1000}"
 ACQUISITION="${ACQUISITION:-}"
 ACQUISITION_OPTS=()
 if [[ -n "$ACQUISITION" ]]; then
+    # A file in acquisitions/ of this repository, or a path, is passed as an absolute path (the orbit
+    # simulation runs from orbits/); any other name is looked up in orbits/data/acquisitions.
+    if [[ -f "$PROJECT_DIR/acquisitions/$ACQUISITION" ]]; then
+        ACQUISITION="$PROJECT_DIR/acquisitions/$ACQUISITION"
+    elif [[ -f "$ACQUISITION" ]]; then
+        ACQUISITION="$(cd -- "$(dirname -- "$ACQUISITION")" && pwd)/$(basename -- "$ACQUISITION")"
+    fi
     ACQUISITION_OPTS=(--acquisition "$ACQUISITION")
 fi
 for argument in "$@"; do
@@ -154,7 +161,7 @@ if [[ "${RENDER_MODE:-frames}" == raw ]]; then
     conda run --no-capture-output -n orbits python "$PROJECT_DIR/pipeline/render_to_raw.py" \
         --cameras "$ORBITS_RUN_DIR/cameras.json" --terrain "$RUN_DIR/terrain_render" \
         --output "$RENDER_DIR" --blender "$BLENDER" "${POOL_OPTS[@]}" \
-        --n-bands "${RAW_BANDS:-32}" --tdi-rows "${RAW_TDI_ROWS:-8}" \
+        --n-bands "${RAW_BANDS:-32}" --tdi-rows "${RAW_TDI_ROWS:-8}" ${RAW_BAND_PITCH:+--band-pitch "$RAW_BAND_PITCH"} \
         --ref-every "${RAW_REF_EVERY:-100}" ${RAW_KEEP_FRAMES:+--keep-frames} -- "${RENDER_ARGS[@]}"
 else
     # Every frame as PNG; --frames/--satellites/--crop in "$@" are honoured, --check-only runs one process.
