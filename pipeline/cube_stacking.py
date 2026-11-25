@@ -1,6 +1,6 @@
 """Stacking of the rendered frames of one satellite into a cube cube[g, c, b] (step 13).
 
-Plan: PLAN_CONTEXT.md, "Stacking into per-satellite cubes", decisions S1-S7. NumPy only;
+Plan: CLAUDE.md, section 9 "Cubes", decisions S1-S11. NumPy only;
 the core functions do no file I/O (the frames come from a caller-supplied reader, the
 geometry from stacking_geometry, which reads the poses).
 

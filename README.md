@@ -551,7 +551,8 @@ Orbit-driven swarm pipeline:
 - `tests/`: tests of the pipeline, `python -m pytest tests/ -q` in the conda environment `orbits`.
 - `archive/`: superseded scripts and the terrain 3D study of step 20, kept for reference; their paths
   are not updated and they may not run from there.
-- `Prompts/`: step-by-step prompts and reports of the development (historical paths).
+- `CLAUDE.md`: context for AI-assisted work (decisions, conventions, history); it replaces the
+  former `Prompts/` folder of step prompts and reports, which is in the git history.
 
 ## Storage
 

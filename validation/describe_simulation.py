@@ -429,7 +429,7 @@ def write(M, C, S, out):
         dev = max(abs(a - b) for a, b in zip(r['realised_m'], m))
         w(f'| {r["sat"]} | {tuple(r["WX"])} | {m[2]:.4f} | {m[3]:.4f} | {m[4]:.4f} | {m[5]:.4f} | {u[2]:.6e} | {u[3]:.6e} | '
           f'{u[4]:.6e} | {u[5]:.6e} | {dev:.1e} |')
-    w(f'\nMax deviation of the metre values from the PLAN_CONTEXT table: {max(r["plan_dev"] for r in M["roe"]):.1e} m.\n')
+    w(f'\nMax deviation of the metre values from the plan table (CLAUDE.md section 6): {max(r["plan_dev"] for r in M["roe"]):.1e} m.\n')
     w('Chief RTN frame (frames.py:6-39, eci_to_lvlh with the chief J2 acceleration): position (r, t, n) in metres and '
       'rotating-frame relative velocity in m/s.\n')
     w('| sat | (r, t, n) m, frame 0 | frame 499 | frame 999 | (vr, vt, vn) m/s, frame 0 | frame 999 |')
@@ -669,7 +669,7 @@ def results_and_limitations(M, C, st, V):
           if T['mode'] == 'ground' else
           [(1, 'dt = GSD / v_g', '0.6716580152896355 ms', f'{T["dt"]*1e3:.16f} ms', 'step 9 (formation_distances.json, results.npz)')]),
         (1, 'nominal footprint across x along', '19420.7 x 14565.5 m', f'{T["footprint"][0]:.1f} x {T["footprint"][1]:.1f} m', 'step 9 (sensor_timing.footprint_m)'),
-        (2, 'ROE metre table', 'PLAN_CONTEXT values', f'max dev {max(r["plan_dev"] for r in M["roe"]):.1e} m', 'step 9 (roe_hex7_dmax1km.json)'),
+        (2, 'ROE metre table', 'plan values (CLAUDE.md)', f'max dev {max(r["plan_dev"] for r in M["roe"]):.1e} m', 'step 9 (roe_hex7_dmax1km.json)'),
         (2, 'ROE realised at t = 0', 'equal to roe_m', f'max dev {max(max(abs(a-b) for a, b in zip(r["realised_m"], r["roe_m"])) for r in M["roe"]):.1e} m', 'step 9 (elements_to_roe of results.npz)'),
         (3, 'states_eci shape', '[1000, 7, 6]', str(M['states_shape']), 'step 9 (results.npz)'),
         (3, 'diff(times) = dt', 'rel 1e-12', f'max abs dev {s8["time_grid"]["dt_dev_max"]:.1e} s', 'validation_summary.json time_grid'),
@@ -682,7 +682,7 @@ def results_and_limitations(M, C, st, V):
         (3, '|dr| = |v| dt', 'rel 1e-6', f'max rel err {max(p["rel_err_max"] for p in s8["poses"]):.1e}', 'validation_summary.json poses'),
         (3, 'SSO RAAN drift', '0.9856 deg/day +/- 0.5%', f'{M["raan_rate_deg_day"]:.5f} deg/day ({(M["raan_rate_deg_day"]/0.9856-1)*100:+.2f}%)', 'step 9 (1-day J2 RK4)'),
         (3, 'chief nadir ground speed', f'report vs v_t = {T["v_target_m_s"]:.3f} m/s at t_c' if T['mode'] == 'ground' else 'report vs v_g = 7059.216 m/s', f'{M["ground_speed"]["mean"]:.3f} m/s', 'step 9 (common_target_ecef_m)'),
-        (3, 'bbox corner margin in the chief frame f0 / f999', '-734 / +387 m (from step 3, prompt_4_per_frame_poses.md:32)',
+        (3, 'bbox corner margin in the chief frame f0 / f999', '-734 / +387 m (from step 3)',
          f'{M["bbox_margin_m"][0]:+.1f} / {M["bbox_margin_m"][999]:+.1f} m', 'step 9'),
         (4, 'chief footprint across x along, f0 / f999', '19420.7 x 14565.5 m +/- 0.5%',
          f'{fp[0][0]:.1f} x {fp[0][1]:.1f} / {fp[999][0]:.1f} x {fp[999][1]:.1f} m', 'step 9 (cameras.json footprint_local_m)'),
@@ -763,7 +763,7 @@ def results_and_limitations(M, C, st, V):
         'Earth orientation: fixed pole, GMST with UTC ~ UT1, no precession/nutation/polar motion; J2 only, no drag, '
         'no third bodies, no SRP (irrelevant over 0.67 s, but the absolute epoch geometry is approximate).',
         'ROE are osculating and applied directly at t = 0 (no mean/osculating map).',
-        'PLAN_CONTEXT disagreements found: ground track azimuth is '
+        'Plan disagreements found: ground track azimuth is '
         f'{M["sub"]["az"]-360:.2f} deg from north at t_c (PLAN estimate "about 9 deg"); the run integrator for the '
         f'1000-sample propagation uses rtol {M["integrator"]["rtol"]}, atol {M["integrator"]["atol"]} (config default), '
         'tighter values only for the chief back-propagation; the osculating a at t = 0 is '

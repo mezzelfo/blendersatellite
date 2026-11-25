@@ -38,7 +38,7 @@ def phase_shift(ref, mov, factor=1000, sigma=None, hann=False):
     """Shift s (rows, cols) such that mov(x) ~ ref(x + s); scene motion is -s.
 
     Default: plain phase correlation. On aliased renders it is biased towards whole-pixel
-    shifts (pixel locking, PLAN_CONTEXT S11). sigma (cycles/px) multiplies the normalised
+    shifts (pixel locking, CLAUDE.md section 9, S11). sigma (cycles/px) multiplies the normalised
     cross-power spectrum by a Gaussian low-pass exp(-(fr^2 + fc^2) / (2 sigma^2)); hann
     applies a separable Hann window to both images first. See phase_shift_s11.
     """

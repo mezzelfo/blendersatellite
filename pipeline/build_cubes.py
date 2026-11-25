@@ -1,6 +1,6 @@
 """Build per-satellite cubes cube[g, c, b, :] from the rendered PNGs (steps 14-16).
 
-Plan: PLAN_CONTEXT.md S1-S9. Geometry and assembly come from cube_stacking.py; this script
+Plan: CLAUDE.md, section 9 (decisions S1-S11). Geometry and assembly come from cube_stacking.py; this script
 only reads the PNGs (Pillow, RGBA) and writes
     <run>/cubes/<layout>_<mode>/cube_satSS.npz
 with keys
@@ -253,7 +253,7 @@ def build_one(run_dir, sat, layout, mode, workers, overwrite, n_frames=cs.N_FRAM
                              'at row r_b, floor clipped to n_frames-2'),
                 geometry='S6: x(k, r, c) = pixel_from_ground(sat, 0, ground_from_pixel(sat, k, r, c, z=0))[0]',
                 png='row from top, col from left, integer = pixel centre; RGBA straight alpha, sRGB',
-                plan='Prompts/PLAN_CONTEXT.md S1-S9', script='pipeline/build_cubes.py', git_commit=git_commit(),
+                plan='CLAUDE.md section 9 (S1-S11)', script='pipeline/build_cubes.py', git_commit=git_commit(),
                 created_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.stem + '.tmp.npz')
