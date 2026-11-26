@@ -48,8 +48,15 @@ older path: do not modify it.
     symbolic link to it: terrain caches) and `output/` (`OUTPUT_ROOT`, runs in progress).
   - `/media/HDD/pareschi/blendersatellite/` (14 TB HDD): `meshes/` (`MESH_STORE`, original ZIPs,
     downloaded once and reused) and `runs/` (finished runs, moved there by hand, including the
-    Melbourne runs of November 2026).
+    Melbourne runs of November 2026). On 25 Nov it gave I/O and read-only errors and was found
+    unmounted (`/dev/sdb1`, ext4, still listed by `lsblk`); the user has no sudo, the admin must check
+    and remount it. Until then `MESH_STORE` is commented out in `~/.bashrc` (an already open shell
+    needs `unset MESH_STORE`) and nothing may be written under `/media/HDD` (it would land on `/`).
   - `output/` in the repo keeps only tracked reports and samples of the Melbourne runs.
+  - `~/ssd2` on osiride is a link to `/media/SSD2/pareschi/blendersatellite`.
+- The Mac mounts the osiride home with sshfs on `~/Osiride` (alias `osiride-mount` in `~/.zshrc`,
+  options `reconnect,ServerAliveInterval=15,follow_symlinks`), so runs are at
+  `~/Osiride/ssd2/output/...`; the mount is lost after a reboot or a long sleep.
 - Mesh servers are reachable from osiride and from a desktop browser; not from sandboxed tools.
 
 ## 4. Repository layout
@@ -60,6 +67,8 @@ older path: do not modify it.
   `export_cube_band_samples.py`.
 - `validation/`: validation and analysis scripts of single steps (import from `pipeline/`); several
   still default to Melbourne run paths that moved to the HDD: pass the paths explicitly.
+  `analyze_cube_run.py --run RUN` quantifies a run's cubes (band alignment, GSD from the model and
+  measured on the terrain orthophoto, geometry between satellites) into `<run>/analysis/`.
 - `tests/`: pytest suite (`conftest.py` adds `pipeline/` to the path).
 - `archive/`: superseded scripts and the step-20 terrain study; paths not updated.
 - `acquisitions/`: acquisition files kept in this repo (looked up before `orbits/data/acquisitions`).
@@ -105,7 +114,8 @@ Tests (on the Mac VM or osiride): `python -m pytest tests/ -q` (about 90 tests, 
 - Frame period: `nominal` = GSD / v_g = 0.6716580 ms (GSD 4.741 m at 500 km) is used by all
   current acquisitions; `ground` makes the chief advance exactly one row per frame at the target.
   With `nominal` the ground advances ~1.008 rows/frame over Melbourne and ~0.99 over Helsinki
-  (0.98 for fore/aft views).
+  (nadir views); the fore/aft views at 20 deg advance about 0.86-0.88 rows/frame (measured on
+  Helsinki: fewer complete lines in their cubes).
 - Formation: `roe_hex7_dmax1km.json`, triangular ROE lattice (sep 1/sqrt(5) km, di_ratio 2, de_phase
   0), lattice edges 894.427 m, neighbours within 1 km. Osculating ROE applied directly at the window
   start. Specification, a x ROE in metres (da = dlam = 0):
@@ -184,7 +194,9 @@ Constraint learned on Helsinki: a ground line is complete in a cube only if ever
 complete lines ~ (rows advanced per frame x frames) - (rows spanned by the bands). On Melbourne the
 small mesh limited the bands to ~900 rows (about 80-100 lines with 1000 frames); on a mesh covering
 the whole frame the bands spread over ~3000 rows and 1000 frames give no complete line. Raw data
-cannot be reused for other band rows: only the stored rows exist.
+cannot be reused for other band rows: only the stored rows exist. The 4200-frame run kept rows
+0..2343 (the rows seeing the scene in frames 0 and 4199) and gave 1864 lines (`none`), ~1820
+(`linear`/`bilinear`, nadir) and 1329-1380 (fore/aft).
 
 ## 9. Cubes (`build_cubes.py`, `cube_stacking.py`, `stacking_geometry.py`)
 
@@ -206,6 +218,28 @@ Decisions S1-S11 (10 November 2026), still valid:
 python pipeline/build_cubes.py --run $RUN --satellites 0 1 2 3 4 5 6 --layout raw_bands \
     --mode none|linear|bilinear --source raw --workers 20
 ```
+Building `linear` and `bilinear` for 4200 frames takes ~10 min and ~23 GB RAM per satellite.
+
+Measured geometry (`validation/analyze_cube_run.py` on `20261125T152217Z_run_II0MDw`, Helsinki +
+Espoo, async 20 deg, 4200 frames, 32 bands over rows 0..2336; displacements as scene motion):
+- `bilinear` aligns the bands of every satellite: inner-band residual 0.002 px, column drift
+  < 0.01 px. It is the mode to use (fore/aft included).
+- Band-to-band parallax of the z = 0 map: +0.057..+0.068 lines per 1000 detector rows (about 0.15 px
+  across the band span), the same in every satellite; it matches a mean scene height of ~30 m
+  above the map plane (1000 rows = 9.5 mrad of view angle).
+- Sensor edge: the band on detector row 0 is off the fit by -0.09 px in every cube and mode (render
+  border effect); the last band is not.
+- `none`: along-track step error -9.8 lines/1000 rows for the chief (0.99 rows/frame), -8.9 and
+  -10.7 for deputies 2 and 5, -135..-140 (curved) for fore/aft; `linear` removes it but leaves the
+  fore/aft column drift (up to ~0.2 px at the centre, ~5 px at the image edges).
+- GSD, model = measured: nadir 4.823-4.831 m along and across (4.741 m x 508.9 / 500 km); `none`
+  along 4.779 m (1% step error). Fore 5.51-5.53 m along, 5.14-5.15 across; aft 5.35-5.37 along,
+  5.07-5.08 across (fore and aft windows are not symmetric about the capture). Measured along-track
+  GSD of fore/aft differs from the model by -0.2 / +0.2 % (buildings leaning in oblique views;
+  registration residual 0.5 px against 0.03 px for nadir).
+- Between satellites: line axis at 163.3 deg for all, relative rotation < 0.002 deg; nadir deputies
+  differ in scale by +-0.1 % (about 2 px at 2000 px from the centre: inter-satellite registration
+  needs a scale, not only a shift); geolocation residual 0.15-0.2 m nadir, ~1 m fore/aft.
 
 ## 10. History
 
@@ -229,7 +263,10 @@ python pipeline/build_cubes.py --run $RUN --satellites 0 1 2 3 4 5 6 --layout ra
 - 24 Nov: textured terrain, quadric decimation, textured walls; first Helsinki + Espoo run done
   (`20261124T164423Z_run_0gu8qs`: async 20 deg, 1000 frames, raw, no walls, 1 m texture, 0.15).
 - 25 Nov: its cubes had no complete line (bands spread over the whole sensor); band pitch option and
-  1550 / 4200-frame acquisitions added; 4200-frame run started (no walls, 2 m texture).
+  1550 / 4200-frame acquisitions added; `Prompts/` replaced by this file; the HDD went offline.
+- 26 Nov: 4200-frame run done (`20261125T152217Z_run_II0MDw`: async 20 deg, raw, no walls, 2 m
+  texture, decimation 0.15; 17.4 h, 7.8 GB GPU per worker); cubes in the three modes; band images in
+  `cube_images/<mode>/banda_XX/sat_YY.png`; `analyze_cube_run.py` written and run (section 9).
 
 ## 11. Open points
 
@@ -243,3 +280,9 @@ python pipeline/build_cubes.py --run $RUN --satellites 0 1 2 3 4 5 6 --layout ra
 - Geoid vs ellipsoid: mesh heights (AHD, EGM96, N2000) are used as ellipsoidal heights.
 - Validation scripts still read `selected_tiles` from cameras.json and old Melbourne paths.
 - Helsinki truncated ZIPs: an e-mail to helsinki3d@hel.fi was drafted, not sent.
+- HDD offline since 25 Nov (section 3): the only copy of the Melbourne runs is there.
+- Sensor edge (-0.09 px on detector row 0): start the bands a few rows inside the frame in
+  `render_to_raw.py` (future runs only).
+- Band parallax (~0.15 px over the span): use the scene's mean height instead of z = 0 in the cube
+  map (`build_cubes.py`; the existing raw data can be restacked).
+- Inter-satellite registration (scale +-0.1 % between nadir views, larger for fore/aft) not done yet.
